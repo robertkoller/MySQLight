@@ -187,6 +187,7 @@ Keywords:  SELECT FROM WHERE INSERT INTO VALUES UPDATE SET DELETE
            CREATE TABLE DROP INDEX ON PRIMARY KEY NOT NULL DEFAULT
            BEGIN COMMIT ROLLBACK AND OR NOT LIKE ORDER BY LIMIT
            JOIN INNER LEFT GROUP HAVING COUNT SUM MIN MAX AVG
+           REFERENCES FOREIGN
 
 Literals:  INTEGER  FLOAT  STRING  IDENTIFIER
 
@@ -229,8 +230,9 @@ type DeleteStmt struct {
 }
 
 type CreateTableStmt struct {
-    Table   string
-    Columns []ColumnDef
+    Table       string
+    Columns     []ColumnDef
+    ForeignKeys []ForeignKeyDef
 }
 
 type CreateIndexStmt struct {
@@ -303,6 +305,14 @@ type IndexDef struct {
     Unique     bool
     RootPageID uint32
 }
+
+type ForeignKeyDef struct {
+    ColumnName   string
+    RefTable     string
+    RefColumn    string
+    OnDelete     FKAction   // RESTRICT | CASCADE | SET NULL
+    OnUpdate     FKAction
+}
 ```
 
 On startup: read the catalog table → rebuild `TableDef` and `IndexDef` maps in memory.
@@ -357,9 +367,9 @@ Limit(10)
 
 ### 3d. INSERT / UPDATE / DELETE
 
-- **INSERT**: serialize row → B+ tree insert. Update all indexes.
-- **UPDATE**: table scan with filter → for each matching row: delete old value, insert new value, update indexes.
-- **DELETE**: table scan with filter → for each matching row: B+ tree delete, remove from all indexes.
+- **INSERT**: serialize row → B+ tree insert. Update all indexes. For each FK column, verify the referenced key exists in the parent table (index scan on parent).
+- **UPDATE**: table scan with filter → for each matching row: delete old value, insert new value, update indexes. If an FK column changes, re-verify the referenced key. If the row is a parent being updated, apply the FK's `ON UPDATE` action to child rows.
+- **DELETE**: table scan with filter → for each matching row: B+ tree delete, remove from all indexes. Before deletion, check if any child table references this row; apply the FK's `ON DELETE` action (`RESTRICT` = error, `CASCADE` = delete children, `SET NULL` = null out the FK column in children).
 
 **Key milestone:** A working database that can CREATE TABLE, INSERT rows, SELECT with WHERE/ORDER BY/LIMIT, UPDATE, and DELETE. All data survives restart.
 
@@ -438,6 +448,10 @@ Convert the AST into a tree of logical operators (same shape as the executor but
 LogicalFilter → LogicalScan → LogicalProject
 ```
 
+The plan is a **tree**, not a DAG, so topological sort is not needed. You build it by recursively walking the AST — each grammar rule maps directly to a logical node, and the resulting tree is already implicitly ordered (leaves are data sources, root is the final output). Evaluation is just a post-order traversal: children before parents.
+
+Topological sort would only become relevant if we added CTEs or subqueries, where a named intermediate result can be referenced more than once and the plan becomes a true DAG. Both are listed as stretch goals; if we add them later, we'd build a dependency graph over the named results and topologically sort it to determine which sub-plans to materialize first.
+
 ### 5b. Rule-Based Optimizer
 
 Apply rewrite rules before choosing physical operators:
@@ -467,6 +481,8 @@ By the end of all phases:
 ```sql
 -- DDL
 CREATE TABLE users (id INTEGER PRIMARY KEY, name TEXT NOT NULL, age INTEGER);
+CREATE TABLE orders (id INTEGER PRIMARY KEY, user_id INTEGER, total FLOAT,
+    FOREIGN KEY (user_id) REFERENCES users (id) ON DELETE CASCADE);
 CREATE INDEX idx_age ON users (age);
 DROP TABLE users;
 DROP INDEX idx_age;
@@ -533,7 +549,8 @@ rows, _ := db.Query("SELECT name FROM users WHERE age > ?", 25)
 
 - **Row-level locking** instead of table-level (MVCC or lock-per-row)
 - **Hash join** and **merge join** in addition to nested-loop
-- **Subqueries** in WHERE and FROM
+- **Subqueries** in WHERE and FROM (plan becomes a DAG; add topological sort over named sub-plans to determine materialization order)
+- **CTEs** (`WITH` clauses) — named intermediate results that may be referenced multiple times; same DAG/topo-sort machinery as subqueries
 - **Views** (stored SELECT statements)
 - **TCP wire protocol** (PostgreSQL-compatible enough to connect with `psql`)
 - **Write buffer / LSM tree** as an alternative to B+ tree for write-heavy workloads
