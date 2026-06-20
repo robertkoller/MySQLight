@@ -21,11 +21,18 @@ type Executor struct {
 	// TODO: txn reference    — needed to acquire locks before reads/writes
 }
 
+// NewExecutor initialises the executor with references to the catalog and transaction manager,
+// which are needed to look up table definitions and acquire locks before any read or write.
 func NewExecutor() *Executor {
 	// TODO: store catalog and txn manager references
 	panic("not implemented")
 }
 
+// Execute dispatches a parsed statement to the correct execution path. SELECT statements
+// are converted to a physical operator pipeline and all rows are collected into a slice.
+// DML statements (INSERT, UPDATE, DELETE) run their own execution logic directly. DDL
+// statements (CREATE TABLE/INDEX, DROP TABLE/INDEX) are delegated to the catalog. Transaction
+// statements (BEGIN, COMMIT, ROLLBACK) are forwarded to the transaction manager.
 func (e *Executor) Execute(stmt interface{}) ([]Row, error) {
 	// TODO: type-switch on stmt:
 	//   *parser.SelectStmt      → buildSelectPlan → collect all rows
@@ -43,6 +50,8 @@ func (e *Executor) Execute(stmt interface{}) ([]Row, error) {
 	panic("not implemented")
 }
 
+// collectRows opens an operator, drains it by calling Next until io.EOF is returned,
+// closes it, and returns all accumulated rows.
 func collectRows(op Operator) ([]Row, error) {
 	// TODO: op.Open(), loop op.Next() until io.EOF, op.Close(), return rows
 	panic("not implemented")

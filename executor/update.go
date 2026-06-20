@@ -1,6 +1,11 @@
 package executor
 
-// executeUpdate handles UPDATE ... SET ... WHERE ...
+// executeUpdate handles UPDATE ... SET ... WHERE ... by looking up the table, acquiring an
+// exclusive lock, and scanning with a filter to find matching rows. For each matching row
+// it evaluates the SET expressions, validates NOT NULL constraints, checks foreign key rules
+// in both directions (verifying new values exist in parent tables and applying ON UPDATE
+// actions to child rows), writes a WAL before-image record, deletes the old B+ tree entry,
+// inserts the updated entry, and updates all affected indexes.
 func executeUpdate(stmt interface{}) error {
 	// TODO: look up the table in the catalog
 	// TODO: acquire an exclusive lock on the table

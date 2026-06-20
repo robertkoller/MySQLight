@@ -1,6 +1,12 @@
 package executor
 
-// executeDelete handles DELETE FROM ... WHERE ...
+// executeDelete handles DELETE FROM ... WHERE ... by looking up the table, acquiring an
+// exclusive lock, and scanning with a filter to find matching rows. For each row it checks
+// whether any child table holds a foreign key reference and applies the configured ON DELETE
+// action: RESTRICT returns an error before anything is deleted, CASCADE deletes child rows
+// recursively, and SET NULL nulls the FK column in all referencing child rows. After FK
+// handling, a WAL before-image record is written and then the row is deleted from the B+
+// tree and all associated indexes.
 func executeDelete(stmt interface{}) error {
 	// TODO: look up the table in the catalog
 	// TODO: acquire an exclusive lock on the table

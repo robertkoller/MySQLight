@@ -68,10 +68,15 @@ type Planner struct {
 	// TODO: catalog reference — needed to validate table/column names
 }
 
+// NewPlanner initialises the planner with a reference to the catalog, which is needed
+// to validate table and column names at plan-build time.
 func NewPlanner() *Planner {
 	panic("not implemented")
 }
 
+// Plan converts a parsed statement into a logical plan tree. Currently only SELECT
+// statements produce a logical plan; DML statements go directly to the executor without
+// planning.
 func (p *Planner) Plan(stmt interface{}) (LogicalNode, error) {
 	// TODO: type-switch on stmt:
 	//   *parser.SelectStmt → planSelect
@@ -79,6 +84,10 @@ func (p *Planner) Plan(stmt interface{}) (LogicalNode, error) {
 	panic("not implemented")
 }
 
+// planSelect builds a logical plan tree for a SELECT statement bottom-up. It starts with
+// a LogicalScan for the FROM table, then wraps it in nodes for WHERE (LogicalFilter),
+// JOIN (LogicalJoin), GROUP BY and aggregates (LogicalAggregate), SELECT list (LogicalProject),
+// ORDER BY (LogicalSort), and LIMIT (LogicalLimit) as each clause is present in the statement.
 func (p *Planner) planSelect(stmt interface{}) (LogicalNode, error) {
 	// TODO: start with LogicalScan{Table: stmt.From}
 	// TODO: if stmt.Where != nil: wrap in LogicalFilter{Predicate: stmt.Where}

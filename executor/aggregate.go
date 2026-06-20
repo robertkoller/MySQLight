@@ -20,10 +20,15 @@ type aggState struct {
 	// TODO: max   interface{}
 }
 
+// NewAggregate stores the child operator, GROUP BY expressions, and aggregate function
+// expressions that will be evaluated once all input rows have been consumed.
 func NewAggregate(child Operator, groupBy []interface{}, aggExprs []interface{}) *Aggregate {
 	panic("not implemented")
 }
 
+// Open opens the child operator, consumes all rows from it, and groups them by the GROUP BY
+// key while accumulating aggregate state (count, sum, min, max). After all rows are read,
+// the final results are materialised into a slice so Next can return them one at a time.
 func (a *Aggregate) Open() error {
 	// TODO: a.child.Open()
 	// TODO: consume all rows from child, build the groups map
@@ -31,12 +36,15 @@ func (a *Aggregate) Open() error {
 	panic("not implemented")
 }
 
+// Next returns aggregated result rows one at a time from the materialised result slice,
+// advancing an internal cursor. Returns io.EOF when all groups have been returned.
 func (a *Aggregate) Next() (Row, error) {
 	// TODO: if a.cursor >= len(a.results) → return nil, io.EOF
 	// TODO: return a.results[a.cursor]; a.cursor++
 	panic("not implemented")
 }
 
+// Close closes the child operator.
 func (a *Aggregate) Close() error {
 	// TODO: a.child.Close()
 	panic("not implemented")
