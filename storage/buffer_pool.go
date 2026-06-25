@@ -115,7 +115,7 @@ func (bp *BufferPool) FlushAll() error {
 	var hasPins bool
 	for _, page := range bp.frames {
 		if page.dirty {
-			hasPins = page.pinCount > 0
+			hasPins = hasPins || page.pinCount > 0
 			if err := bp.pager.WritePage(page.ID, page.Data); err != nil {
 				return err
 			}

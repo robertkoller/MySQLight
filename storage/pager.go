@@ -86,7 +86,7 @@ func (p *Pager) ReadPage(pageID uint32) ([]byte, error) {
 	}
 
 	buffer := make([]byte, PageSize)
-	p.pages.Seek(int64(pageID*PageSize), 0)
+	p.pages.Seek(int64(pageID)*PageSize, 0)
 
 	if _, err := io.ReadFull(p.pages, buffer); err != nil {
 		return nil, err
