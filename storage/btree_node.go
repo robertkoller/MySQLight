@@ -155,7 +155,7 @@ func (n *Node) leafValue(i int) []byte {
 	return n.data[valueOffset : valueOffset+valueLen]
 }
 
-// rightSibling decodes the four-byte big-endian uint32 at offset 3, which is the page ID
+// rightSibling decodes the four-byte big-endian uint32 at offset 5, which is the page ID
 // of the next leaf in the sorted chain. A value of zero means this is the rightmost leaf.
 func (n *Node) rightSibling() uint32 {
 	return binary.BigEndian.Uint32(n.data[5:])
@@ -173,7 +173,7 @@ func (n *Node) internalKey(i int) []byte {
 }
 
 // childPageID decodes the uint32 child page ID at position i within the internal node.
-// Child page IDs are stored starting at byte offset 3, each taking four bytes, so child i
+// Child page IDs are stored starting at byte offset 5, each taking four bytes, so child i
 // is at offset 5 + i*4.
 func (n *Node) childPageID(i int) uint32 {
 	return binary.BigEndian.Uint32(n.data[5+(i*4):])

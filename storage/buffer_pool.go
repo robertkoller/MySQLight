@@ -101,10 +101,6 @@ func (bp *BufferPool) UnpinPage(pageID uint32, dirty bool) error {
 		page.dirty = true
 	}
 
-	if page.pinCount == 0 {
-		bp.lruList.MoveToBack(bp.lruMap[pageID])
-	}
-
 	return nil
 }
 
@@ -112,21 +108,13 @@ func (bp *BufferPool) UnpinPage(pageID uint32, dirty bool) error {
 // marks them clean. This is called during checkpointing and when the database is closing
 // to ensure no modified data is left only in memory.
 func (bp *BufferPool) FlushAll() error {
-	var hasPins bool
 	for _, page := range bp.frames {
 		if page.dirty {
-			hasPins = hasPins || page.pinCount > 0
 			if err := bp.pager.WritePage(page.ID, page.Data); err != nil {
 				return err
 			}
-
 			page.dirty = false
 		}
 	}
-
-	if hasPins {
-		return errors.New("Pins were detected when flushing")
-	}
-
 	return nil
 }
