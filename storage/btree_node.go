@@ -36,6 +36,28 @@ type Node struct {
 	data     []byte // raw page bytes (PageSize)
 }
 
+// creates the header for a new leaf node
+func makeNewLeafHeader() []byte {
+	header := make([]byte, PageSize)
+	header[0] = byte(NodeLeaf)
+	binary.BigEndian.PutUint16(header[1:], 0)
+	binary.BigEndian.PutUint16(header[3:], PageSize)
+
+	return header
+
+}
+
+// creates the header for a new internal node
+func makeNewInternalHeader() []byte {
+	header := make([]byte, PageSize)
+	header[0] = byte(NodeInternal)
+	binary.BigEndian.PutUint16(header[1:], 0)
+	binary.BigEndian.PutUint16(header[3:], PageSize)
+
+	return header
+
+}
+
 // decodeNode reads the node type byte at offset 0 of the raw page data and returns
 // a Node wrapping those bytes. It returns an error if the type byte is not a known NodeType.
 func decodeNode(pageID uint32, data []byte) (*Node, error) {
@@ -47,11 +69,21 @@ func decodeNode(pageID uint32, data []byte) (*Node, error) {
 	return &Node{pageID, NodeType(nodeType), data}, nil
 }
 
+// isLeaf reports whether this node is a leaf.
+func (n *Node) isLeaf() bool {
+	return n.nodeType == NodeLeaf
+}
+
 // keyCount decodes the two-byte big-endian uint16 at offset 1, which stores the number
 // of keys currently held in this node.
 func (n *Node) keyCount() uint16 {
 	count := binary.BigEndian.Uint16(n.data[1:])
 	return count
+}
+
+// Increments the keyCount
+func (n *Node) incrementKeyCount() {
+	binary.BigEndian.PutUint16(n.data[1:], n.keyCount()+1)
 }
 
 // Reads the freeSpacePtr
@@ -65,34 +97,33 @@ func (n *Node) newFreeSpace(newPtr uint16) {
 	binary.BigEndian.PutUint16(n.data[3:], newPtr)
 }
 
-// Increments the keyCount
-func (n *Node) incrementKeyCount() {
-	binary.BigEndian.PutUint16(n.data[1:], n.keyCount()+1)
+// leafKey reads the key offset for slot i from the leaf's slot array and returns the
+// key bytes at that position within the page.
+func (n *Node) leafKey(i int) []byte {
+	offset := slotStart + (i * 8)
+	keyOffset := binary.BigEndian.Uint16(n.data[offset:])
+	keyLen := binary.BigEndian.Uint16(n.data[offset+2:])
+	return n.data[keyOffset : keyOffset+keyLen]
 }
 
-func (n *Node) isLeaf() bool {
-	return n.nodeType == NodeLeaf
+// leafValue reads the value offset for slot i from the leaf's slot array and returns
+// the value bytes at that position within the page.
+func (n *Node) leafValue(i int) []byte {
+	offset := slotStart + (i * 8) + 4
+	valueOffset := binary.BigEndian.Uint16(n.data[offset:])
+	valueLen := binary.BigEndian.Uint16(n.data[offset+2:])
+	return n.data[valueOffset : valueOffset+valueLen]
 }
 
-// creates the header for a new leaf node
-func makeNewLeafHeader() []byte {
-	header := make([]byte, PageSize)
-	header[0] = byte(NodeLeaf)
-	binary.BigEndian.PutUint16(header[1:], 0)
-	binary.BigEndian.PutUint16(header[3:], PageSize)
-
-	return header
-
+// rightSibling decodes the pageID for the next leaf in the chain. a 0 value means this is the
+// // rightmost leaf
+func (n *Node) rightSibling() uint32 {
+	return binary.BigEndian.Uint32(n.data[5:])
 }
 
-func makeNewInternalHeader() []byte {
-	header := make([]byte, PageSize)
-	header[0] = byte(NodeInternal)
-	binary.BigEndian.PutUint16(header[1:], 0)
-	binary.BigEndian.PutUint16(header[3:], PageSize)
-
-	return header
-
+// Sets the right sibling
+func (n *Node) setRightSibling(pageID uint32) {
+	binary.BigEndian.PutUint32(n.data[5:], pageID)
 }
 
 // Inserts a key and value entry into the page
@@ -115,6 +146,27 @@ func (n *Node) insertLeafEntry(key, value []byte, slotIndex int) {
 	n.incrementKeyCount()
 }
 
+// childPageID decodes the uint32 child page ID at position i within the internal node.
+// Child page IDs are stored starting at byte offset 5, each taking four bytes, so child i
+// is at offset 5 + i*4.
+func (n *Node) childPageID(i int) uint32 {
+	return binary.BigEndian.Uint32(n.data[5+(i*4):])
+}
+
+// internalKey locates the key slot array, which starts after the child page ID section,
+// and returns the key bytes at slot i.
+func (n *Node) internalKey(i int) []byte {
+	offset := 5 + ((n.keyCount() + 1) * 4) // this gets us to the key slots
+	offsetI := offset + uint16((i * 4))    // this gets us to where the key is
+	keyOffset := binary.BigEndian.Uint16(n.data[offsetI:])
+	keyLen := binary.BigEndian.Uint16(n.data[offsetI+2:])
+
+	return n.data[keyOffset : keyOffset+keyLen]
+}
+
+// insertInternalEntry inserts a separator key at slotIndex and its new right child at child
+// position slotIndex+1. Because adding a child pointer pushes the key slot array right by 4
+// bytes, the existing key slots are physically shifted before the new slot is written.
 func (n *Node) insertInternalEntry(key []byte, slotIndex int, rightChildID uint32) {
 	insertKeyIndex := n.findFreeSpace() - uint16(len(key))
 	slotsBase := 5 + (n.keyCount()+1)*4
@@ -135,51 +187,4 @@ func (n *Node) insertInternalEntry(key []byte, slotIndex int, rightChildID uint3
 
 	n.newFreeSpace(insertKeyIndex)
 	n.incrementKeyCount()
-}
-
-// leafKey reads the key offset for slot i from the leaf's slot array and returns the
-// key bytes at that position within the page.
-func (n *Node) leafKey(i int) []byte {
-	offset := slotStart + (i * 8)
-	keyOffset := binary.BigEndian.Uint16(n.data[offset:])
-	keyLen := binary.BigEndian.Uint16(n.data[offset+2:])
-	return n.data[keyOffset : keyOffset+keyLen]
-}
-
-// leafValue reads the value offset for slot i from the leaf's slot array and returns
-// the value bytes at that position within the page.
-func (n *Node) leafValue(i int) []byte {
-	offset := slotStart + (i * 8) + 4
-	valueOffset := binary.BigEndian.Uint16(n.data[offset:])
-	valueLen := binary.BigEndian.Uint16(n.data[offset+2:])
-	return n.data[valueOffset : valueOffset+valueLen]
-}
-
-// rightSibling decodes the four-byte big-endian uint32 at offset 5, which is the page ID
-// of the next leaf in the sorted chain. A value of zero means this is the rightmost leaf.
-func (n *Node) rightSibling() uint32 {
-	return binary.BigEndian.Uint32(n.data[5:])
-}
-
-// internalKey locates the key slot array, which starts after the child page ID section,
-// and returns the key bytes at slot i.
-func (n *Node) internalKey(i int) []byte {
-	offset := 5 + ((n.keyCount() + 1) * 4) // this gets us to the key slots
-	offsetI := offset + uint16((i * 4))    // this gets us to where the key is
-	keyOffset := binary.BigEndian.Uint16(n.data[offsetI:])
-	keyLen := binary.BigEndian.Uint16(n.data[offsetI+2:])
-
-	return n.data[keyOffset : keyOffset+keyLen]
-}
-
-// childPageID decodes the uint32 child page ID at position i within the internal node.
-// Child page IDs are stored starting at byte offset 5, each taking four bytes, so child i
-// is at offset 5 + i*4.
-func (n *Node) childPageID(i int) uint32 {
-	return binary.BigEndian.Uint32(n.data[5+(i*4):])
-}
-
-// Sets the right sibling
-func (n *Node) setRightSibling(pageID uint32) {
-	binary.BigEndian.PutUint32(n.data[5:], pageID)
 }

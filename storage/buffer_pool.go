@@ -118,3 +118,20 @@ func (bp *BufferPool) FlushAll() error {
 	}
 	return nil
 }
+
+// This will be changed later with freelist
+func (bp *BufferPool) AllocatePage() (uint32, error) {
+	return bp.pager.AllocatePage()
+}
+
+// Fetches and creates a node object representing a certain page
+func (bp *BufferPool) fetchNode(id uint32) (*Page, *Node, error) {
+	page, err := bp.FetchPage(id)
+	if err != nil {
+		return page, nil, err
+	}
+
+	node, err := decodeNode(id, page.Data)
+	return page, node, err
+
+}
