@@ -86,6 +86,11 @@ func (n *Node) incrementKeyCount() {
 	binary.BigEndian.PutUint16(n.data[1:], n.keyCount()+1)
 }
 
+// Decrements the keyCount
+func (n *Node) decrementKeyCount() {
+	binary.BigEndian.PutUint16(n.data[1:], n.keyCount()-1)
+}
+
 // Reads the freeSpacePtr
 func (n *Node) findFreeSpace() uint16 {
 	freeSpacePointer := binary.BigEndian.Uint16(n.data[3:])
@@ -127,7 +132,7 @@ func (n *Node) setRightSibling(pageID uint32) {
 }
 
 // Inserts a key and value entry into the page
-func (n *Node) insertLeafEntry(key, value []byte, slotIndex int) {
+func (n *Node) insertLeafEntry(key []byte, value []byte, slotIndex int) {
 	insertValue := n.findFreeSpace() - uint16(len(value))
 	copy(n.data[insertValue:], value)
 	insertKey := insertValue - uint16(len(key))
@@ -144,6 +149,13 @@ func (n *Node) insertLeafEntry(key, value []byte, slotIndex int) {
 	copy(n.data[slotByte+8:], n.data[slotByte:slotStart+int(n.keyCount())*8])
 	copy(n.data[slotByte:], slotInsert)
 	n.incrementKeyCount()
+}
+
+// Delete a leaf entry by shifting things down over it
+func (n *Node) deleteLeafEntry(slotIndex int) {
+	slotByte := slotStart + slotIndex*8
+	copy(n.data[slotByte:], n.data[slotByte+8:slotStart+int(n.keyCount()*8)])
+	n.decrementKeyCount()
 }
 
 // childPageID decodes the uint32 child page ID at position i within the internal node.
@@ -187,4 +199,119 @@ func (n *Node) insertInternalEntry(key []byte, slotIndex int, rightChildID uint3
 
 	n.newFreeSpace(insertKeyIndex)
 	n.incrementKeyCount()
+}
+
+// deletes internal entry and shifts stuff down
+func (n *Node) deleteInternalEntry(seperatorKeyIndex int, childIndex int) error {
+	oldCount := int(n.keyCount())
+	var keys [][]byte
+	var children []uint32
+	for i := 0; i < oldCount; i++ {
+		if i != seperatorKeyIndex {
+			keys = append(keys, n.internalKey(i))
+		}
+		if i != childIndex {
+			children = append(children, n.childPageID(i))
+		}
+	}
+	if oldCount != childIndex {
+		children = append(children, n.childPageID(oldCount))
+	}
+
+	temp := makeNewInternalHeader()
+	tempNode, err := decodeNode(n.pageID, temp)
+	if err != nil {
+		return err
+	}
+
+	binary.BigEndian.PutUint32(temp[5:], children[0])
+	for i := 0; i < len(keys); i++ {
+		tempNode.insertInternalEntry(keys[i], i, children[i+1])
+	}
+	copy(n.data, temp)
+	return nil
+}
+
+// replaceInternalKey replaces separator key i with newKey. It rebuilds the page rather than
+// writing the new key below the free-space pointer in place: the free-space pointer only ever
+// moves down, so repeated in-place replacements (one per leaf-borrow and rotation) would leak
+// the old keys' bytes and eventually march the pointer into the child/slot region, corrupting
+// the node. Rebuilding compacts the live keys on every call.
+func (n *Node) replaceInternalKey(i int, newKey []byte) {
+	keys := make([][]byte, 0, int(n.keyCount()))
+	for j := 0; j < int(n.keyCount()); j++ {
+		if j == i {
+			keys = append(keys, append([]byte(nil), newKey...))
+		} else {
+			keys = append(keys, append([]byte(nil), n.internalKey(j)...))
+		}
+	}
+	children := make([]uint32, 0, int(n.keyCount())+1)
+	for j := 0; j <= int(n.keyCount()); j++ {
+		children = append(children, n.childPageID(j))
+	}
+	n.rebuildInternal(keys, children)
+}
+
+// Returns the number bytes the leaf is using (storage amount)
+func (n *Node) leafLiveBytes() int {
+	total := slotStart + int(n.keyCount())*8
+	for i := 0; i < int(n.keyCount()); i++ {
+		total += len(n.leafKey(i)) + len(n.leafValue(i))
+	}
+	return total
+}
+
+// internalLiveBytes returns how many bytes this internal node is using
+func (n *Node) internalLiveBytes() int {
+	total := 5 + (int(n.keyCount())+1)*4 + int(n.keyCount())*4
+	for i := 0; i < int(n.keyCount()); i++ {
+		total += len(n.internalKey(i))
+	}
+	return total
+}
+
+// rebuildLeaf rewrites this leaf's page to hold exactly the given key/value pairs, packed
+// with no dead space. this was an issue when deleting as we would have leftover space
+func (n *Node) rebuildLeaf(keys [][]byte, values [][]byte) error {
+	sibling := n.rightSibling()
+	temp := makeNewLeafHeader()
+	tempNode, err := decodeNode(n.pageID, temp)
+	if err != nil {
+		return err
+	}
+	for i := 0; i < len(keys); i++ {
+		tempNode.insertLeafEntry(keys[i], values[i], i)
+	}
+	copy(n.data, temp)
+	n.setRightSibling(sibling)
+	return nil
+}
+
+// compactLeaf rewrites the leaf in place from its own live entries, reclaiming the dead
+// bytes left behind by deleteLeafEntry
+func (n *Node) compactLeaf() error {
+	keys := make([][]byte, 0, int(n.keyCount()))
+	values := make([][]byte, 0, int(n.keyCount()))
+	for i := 0; i < int(n.keyCount()); i++ {
+		keys = append(keys, append([]byte(nil), n.leafKey(i)...))
+		values = append(values, append([]byte(nil), n.leafValue(i)...))
+	}
+	return n.rebuildLeaf(keys, values)
+}
+
+// rebuildInternal overwrites this internal node's page so it holds exactly the given
+// separator keys and child page IDs
+func (n *Node) rebuildInternal(keys [][]byte, children []uint32) error {
+	temp := makeNewInternalHeader()
+	tempNode, err := decodeNode(n.pageID, temp)
+	if err != nil {
+		return err
+	}
+	binary.BigEndian.PutUint32(temp[5:], children[0])
+	for i := 0; i < len(keys); i++ {
+		tempNode.insertInternalEntry(keys[i], i, children[i+1])
+	}
+	copy(n.data, temp)
+	return nil
 }
