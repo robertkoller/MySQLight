@@ -121,12 +121,20 @@ func (p *Pager) WritePage(pageID uint32, data []byte) error {
 // page — that is the caller's responsibility.
 func (p *Pager) AllocatePage() (uint32, error) {
 	newID := p.pageCount
+
+	// This section makes it so that the file is immediately readable
+	buffer := make([]byte, PageSize)
+	p.pages.Seek(int64(newID)*PageSize, 0)
+	if _, err := p.pages.Write(buffer); err != nil {
+		return 0, err
+	}
+
+	// this section just updates the header
 	p.pageCount++
 	p.pages.Seek(11, 0)
-
-	buffer := make([]byte, 4)
-	binary.BigEndian.PutUint32(buffer, p.pageCount)
-	if _, err := p.pages.Write(buffer); err != nil {
+	count := make([]byte, 4)
+	binary.BigEndian.PutUint32(count, p.pageCount)
+	if _, err := p.pages.Write(count); err != nil {
 		return 0, err
 	}
 

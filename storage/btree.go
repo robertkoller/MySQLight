@@ -8,8 +8,10 @@ import (
 )
 
 var ErrDuplicateKey = errors.New("duplicate key")
-
+var ErrEntryTooLarge = errors.New("Entry too large to fit into page")
 var ErrNotFound = errors.New("entry not found")
+
+const entryCap = ((PageSize - slotStart) / 3) // so that when we split the page in half we dont overflow with 4000 bytes entries
 
 // Iterator is returned by Scan for range queries.
 type Iterator interface {
@@ -49,6 +51,9 @@ func NewBTree(pager *Pager, rootPageID uint32) (*BTree, error) {
 // key is pushed up to the parent. Splits propagate upward recursively; if the root itself
 // splits, a new root page is allocated to keep the tree balanced.
 func (t *BTree) Insert(key, value []byte) error {
+	if len(key)+len(value)+8 > entryCap {
+		return ErrEntryTooLarge
+	}
 	leafPageID, path, err := t.findLeaf(key)
 	if err != nil {
 		return err
@@ -70,7 +75,7 @@ func (t *BTree) Insert(key, value []byte) error {
 			return err
 		}
 		// Gotta recall this just in case the leaf changed
-		leafPageID, path, err = t.findLeaf(key)
+		leafPageID, path, err = t.findLeaf(key) // TODO: Make this more efficient my not traversing fully every time
 		if err != nil {
 			return err
 		}
@@ -84,6 +89,16 @@ func (t *BTree) Insert(key, value []byte) error {
 	if insert < int(node.keyCount()) && bytes.Equal(node.leafKey(insert), key) {
 		return ErrDuplicateKey
 	}
+
+	// This shouldnt be reachable here
+	// but we recheck anyway because if that invariant is ever violated because of future code change
+	// it would silently corrupt so we add this safety check for future code improvements
+	needed = (len(key) + len(value) + 8)
+	available = int(node.findFreeSpace()) - (slotStart + int(node.keyCount())*8)
+	if needed > available {
+		return ErrEntryTooLarge
+	}
+
 	node.insertLeafEntry(key, value, insert)
 
 	if err := t.pager.WritePage(leafPageID, node.data); err != nil {
@@ -305,27 +320,15 @@ func (t *BTree) findLeafRecursive(pageNum uint32, curr []uint32, key []byte) (le
 	if node.nodeType == NodeLeaf {
 		return pageNum, curr, nil
 	} else {
-		count := node.keyCount()
-		var compare int
-		for i := 0; i < int(count); i++ {
-			compare = bytes.Compare(key, node.internalKey(i))
-			if compare < 0 {
-				childID := node.childPageID(i)
-				curr = append(curr, pageNum)
-				return t.findLeafRecursive(childID, curr, key)
-			}
-		}
-
-		// not found in tree so we take everything > the last key entry
-		childID := node.childPageID(int(count))
+		insert := binarySearchKeys(node, key, false)
+		childID := node.childPageID(insert)
 		curr = append(curr, pageNum)
 		return t.findLeafRecursive(childID, curr, key)
-
 	}
 }
 
 // searches for where to insert a key
-// if leaf = false its internal
+// if leaf = false its internal so we look for what child to descend into
 func binarySearchKeys(node *Node, key []byte, leaf bool) int {
 	low := 0
 	high := int(node.keyCount()) - 1
@@ -338,16 +341,19 @@ func binarySearchKeys(node *Node, key []byte, leaf bool) int {
 			comparison = bytes.Compare(node.internalKey(mid), key)
 		}
 
-		if comparison == 0 {
-			return mid
+		if leaf {
+			if comparison < 0 {
+				low = mid + 1
+			} else {
+				high = mid - 1
+			}
 		}
-		// check right half
-		if comparison == -1 {
-			low = mid + 1
-		}
-
-		if comparison == 1 {
-			high = mid - 1
+		if !leaf {
+			if comparison <= 0 {
+				low = mid + 1
+			} else {
+				high = mid - 1
+			}
 		}
 	}
 
