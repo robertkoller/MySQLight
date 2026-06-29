@@ -642,7 +642,7 @@ func (t *BTree) rebalanceLeaf(leaf *Node, key []byte, path []uint32) error {
 		left.setRightSibling(leaf.rightSibling())
 		parent.deleteInternalEntry(childIndex-1, childIndex)
 		leftDirty = true
-		// TODO: FreePage(leaf) once the freelist exists
+		t.pool.FreePage(leaf.pageID)
 	} else {
 		var keys, values [][]byte
 		for i := 0; i < int(leaf.keyCount()); i++ {
@@ -659,7 +659,7 @@ func (t *BTree) rebalanceLeaf(leaf *Node, key []byte, path []uint32) error {
 		leaf.setRightSibling(right.rightSibling())
 		parent.deleteInternalEntry(childIndex, childIndex+1)
 		rightDirty = true
-		// TODO: FreePage(right) once the freelist exists
+		t.pool.FreePage(right.pageID)
 	}
 
 	// The merge removed a separator from the parent, which may now underflow.
@@ -667,7 +667,7 @@ func (t *BTree) rebalanceLeaf(leaf *Node, key []byte, path []uint32) error {
 		// parent is the root: only act if it has collapsed to a single child.
 		if parent.keyCount() == 0 {
 			t.rootPageID = parent.childPageID(0)
-			// TODO: FreePage(old root) once the freelist exists
+			t.pool.FreePage(parent.pageID)
 		}
 		return nil
 	}
@@ -836,7 +836,7 @@ func (t *BTree) rebalanceInternal(node *Node, key []byte, path []uint32) error {
 		}
 		parent.deleteInternalEntry(childIndex-1, childIndex)
 		leftDirty = true
-		// TODO: FreePage(node.pageID) once the freelist exists
+		t.pool.FreePage(node.pageID)
 	} else {
 		// Merge right into node; node survives, right is orphaned.
 		separator := append([]byte(nil), parent.internalKey(childIndex)...)
@@ -860,7 +860,7 @@ func (t *BTree) rebalanceInternal(node *Node, key []byte, path []uint32) error {
 		}
 		parent.deleteInternalEntry(childIndex, childIndex+1)
 		rightDirty = true
-		// TODO: FreePage(rightID) once the freelist exists
+		t.pool.FreePage(right.pageID)
 	}
 
 	// The merge removed a separator from the parent, which may now underflow.
@@ -868,7 +868,7 @@ func (t *BTree) rebalanceInternal(node *Node, key []byte, path []uint32) error {
 		// parent is the root: only act if it has collapsed to a single child.
 		if parent.keyCount() == 0 {
 			t.rootPageID = parent.childPageID(0)
-			// TODO: FreePage(old root) once the freelist exists
+			t.pool.FreePage(parent.pageID)
 		}
 		return nil
 	}

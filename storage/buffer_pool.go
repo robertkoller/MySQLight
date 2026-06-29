@@ -135,3 +135,13 @@ func (bp *BufferPool) fetchNode(id uint32) (*Page, *Node, error) {
 	return page, node, err
 
 }
+
+// Free a page from the bufferpool as well to avoid stale refrences
+func (bp *BufferPool) FreePage(pageID uint32) error {
+	if element, ok := bp.lruMap[pageID]; ok {
+		bp.lruList.Remove(element)
+		delete(bp.lruMap, pageID)
+		delete(bp.frames, pageID)
+	}
+	return bp.pager.FreePage(pageID)
+}
