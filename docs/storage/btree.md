@@ -1,13 +1,13 @@
 # `btree.go` — The B+ Tree
 
-The core data structure. Every table and every index in MySQLight is one of
-these. It stores sorted `[]byte` key/value pairs across pages, splitting nodes as
-they fill so the tree stays balanced, and (when finished) supports point lookups,
-range scans, and deletes.
+The core data structure. Every table and every index in MySQLight is one of these.
+It stores sorted `[]byte` key/value pairs across pages, splitting nodes as they
+fill and merging/rotating as they empty so the tree stays balanced, and supports
+point lookups, range scans, inserts, and deletes.
 
-It builds on the page format in [`btree_node.go`](btree-node.md) and currently
-does its I/O directly through the [Pager](pager.md) (the [BufferPool](buffer-pool.md)
-is intended to sit in between but is not yet wired in).
+It builds on the page format in [`btree_node.go`](btree-node.md) and does all I/O
+through the [BufferPool](buffer-pool.md) — every node is reached via
+`pool.fetchNode` and released with `pool.UnpinPage`.
 
 ---
 
@@ -15,8 +15,8 @@ is intended to sit in between but is not yet wired in).
 
 ```go
 type BTree struct {
-    pager      *Pager
-    rootPageID uint32
+    pool       *BufferPool
+    rootPageID uint32       // changes when the root splits or collapses
 }
 
 type Iterator interface {
@@ -25,124 +25,146 @@ type Iterator interface {
 }
 ```
 
-Keys are compared with `bytes.Compare` — the tree is type-agnostic.
+Keys are compared with `bytes.Compare` — the tree is type-agnostic. Errors:
+`ErrDuplicateKey`, `ErrNotFound`, `ErrEntryTooLarge`.
+
+### `NewBTree(pool, rootPageID) (*BTree, error)`
+- `rootPageID == 0`: allocate a page, format it as an empty leaf, use it as root.
+- otherwise: open at the existing root. (Nothing persists the root id yet — the
+  caller must remember it across reopens; that becomes the catalog's job in a later
+  phase.)
 
 ---
 
-## `NewBTree(pager, rootPageID) (*BTree, error)`
-- `rootPageID == 0`: allocate a page, format it as an empty leaf
-  (`makeNewLeafHeader`), write it, and use it as the root.
-- otherwise: open the tree at the existing root.
+## Pin discipline (the invariant behind everything)
+
+Every `fetchNode`/`FetchPage` is balanced by exactly one `UnpinPage`. `findLeaf`
+unpins each node as it descends, so it returns an **unpinned** leaf id plus the
+path of internal ids above it. Functions that hand a node to a helper document who
+owns the unpin (e.g. `Delete` owns the leaf; `rebalanceLeaf` owns the parent and
+siblings it fetches).
 
 ---
 
 ## Insert path
 
 ### `Insert(key, value) error`
-1. `findLeaf(key)` → target leaf page ID + the path of internal pages above it.
-2. Compute the leaf overflow check (`needed` vs `available`, in `int`).
-3. If it would overflow, `splitLeaf`, then **re-run `findLeaf`** — the split may
-   have moved the target key into the new right leaf (and may even have grown the
-   root), so the original leaf reference can be stale.
-4. `binarySearchKeys(node, key, true)` finds the sorted slot index.
-5. `insertLeafEntry` writes the entry; the page is written back.
+1. Reject entries larger than `entryCap` (so two can't fail to fit after a split).
+2. `findLeaf(key)` → leaf id + path. Reject duplicates.
+3. Overflow check (`needed` vs `available`, in `int`). If it would overflow,
+   `splitLeaf`, then **re-find** the target leaf (the split may have moved the key
+   right or grown the root).
+4. `binarySearchKeys(node, key, true)` → slot; `insertLeafEntry`; unpin dirty.
 
-### `splitLeaf(node, leafPageID, path) error`
-Splits a full leaf into two:
-1. Save the current `rightSibling` before reformatting.
-2. Allocate a new page for the right half.
-3. Copy all key/value pairs into memory.
-4. Reformat the original page and re-insert the left half `[0, midpoint)`.
-5. Build the right half `[midpoint, count)` on the new page; set its right sibling
-   to the saved value, and set the original leaf's right sibling to the new page.
-6. Write both pages.
-7. `pushUp(keys[midpoint], newPageID, path)` — the median key is **copied** up
-   (it still lives in the right leaf, because leaves hold the real data).
+### `splitLeaf` / `splitInternal`
+Both split a full node by a **byte-weighted midpoint** (not a count midpoint), so
+variable-size entries divide evenly:
+- **Leaf:** copy entries out, reformat the original as the left half, build the
+  right half on a newly allocated page, fix the right-sibling chain, then
+  `pushUp(median, rightPage, path)`. The median is **copied** up (the real entry
+  stays in the right leaf).
+- **Internal:** splice the incoming `(newKey, newChild)` into the key/child arrays,
+  pick the byte-midpoint, rebuild left + right pages. The median is **moved** up
+  (internal keys are only routers), via `pushUp(median, rightPage, path[:len-1])`.
 
-### `splitInternal(node, nodePageID, newKey, newChild, path) error` — *in progress*
-Splits a full internal node while inserting a new separator. Unlike a leaf split,
-the median is **moved** up, not copied — internal keys are only routers.
+### `pushUp(medianKey, rightPageID, path)`
+- **`path` empty (root split):** allocate a new internal root with two children and
+  the median key; update `rootPageID`; the tree grows one level.
+- **otherwise:** load `path[last]`. If it has room, `insertInternalEntry`; if full,
+  `splitInternal`, which recurses upward.
 
-Intended algorithm (collect → insert → split):
-1. Allocate the right page.
-2. Collect existing keys (`internalKey`) and the `n+1` children (`childPageID`)
-   into memory **with `append`** (not index assignment into nil slices).
-3. `index = binarySearchKeys(node, newKey, false)`.
-4. Splice into fresh slices (avoid append-aliasing): keys become
-   `keys[:index] + newKey + keys[index:]`; children become
-   `children[:index+1] + newChild + children[index+1:]`.
-5. `m = len(keys)/2`. `keys[m]` is pushed up and belongs to **neither** half.
-   - left = `keys[0..m-1]`, `children[0..m]` (rebuilt in place on `nodePageID`)
-   - right = `keys[m+1..]`, `children[m+1..]` (new page)
-   Rebuild each via `makeNewInternalHeader`, write `children[0]` at offset 5, then
-   `insertInternalEntry` the rest.
-6. Write both pages, then `pushUp(keys[m], rightPageID, path[:len-1])`.
+---
 
-> **Current status:** not finished/compiling. The collection loop assigns into
-> nil slices (needs `append`), the splice is reversed and has an aliasing bug, the
-> median/rebuild/write/return steps are missing, and `makeNewInternalHeader` does
-> not exist yet.
+## Get
 
-### `pushUp(medianKey, rightPageID, path) error`
-Inserts a separator + new right child one level up.
-- **`path` empty (root split):** allocate a new root internal node with two
-  children (old root + new right page) and one key (`medianKey`), and update
-  `rootPageID`. The tree grows one level.
-- **otherwise:** load `path[last]`. If it has room, find the slot with
-  `binarySearchKeys(parent, medianKey, false)`, `insertInternalEntry`, write it.
-  If it is full, hand off to `splitInternal`, which inserts and recurses upward.
+### `Get(key) ([]byte, error)`
+`findLeaf` → `binarySearchKeys(.., true)`; on an exact match return a **copy** of
+the value (the page is unpinned on return), else `ErrNotFound`.
 
-> **Current status:** the root-split branch and the has-room branch are correct.
-> The full-parent branch still calls `splitLeaf` on an internal node (wrong layout)
-> — it should call `splitInternal`.
+---
+
+## Delete path
+
+### `Delete(key) error`
+`findLeaf` → locate the slot (`ErrNotFound` if absent) → `deleteLeafEntry`. If the
+leaf is the root, or still ≥ half full (`leafLiveBytes() >= PageSize/2`), done.
+Otherwise `rebalanceLeaf`.
+
+### `rebalanceLeaf(leaf, key, path)`
+Fetches the parent and both existing siblings, then decides — priority:
+1. **Borrow** from a sibling that can spare an entry and stay ≥ half full (pick the
+   fuller one). Move one entry across and fix the parent separator with
+   `replaceInternalKey`. (Compacts the destination leaf first so the append can't
+   overflow a fragmented page.)
+2. else **merge** if the two leaves actually fit in one page — rebuild the survivor
+   from both nodes' live entries, fix the sibling chain, remove the separator from
+   the parent (`deleteInternalEntry`), and `FreePage` the dead leaf.
+3. else **forced borrow** from the (necessarily large) sibling — covers the case
+   where a sibling is too full to lend yet too full to merge with, which variable-
+   size entries make possible.
+
+A merge shrinks the parent, which is then fixed up: if the parent is the root and
+collapsed to a single child, promote that child and free the old root; else if the
+parent underflows, recurse into `rebalanceInternal`.
+
+### `rebalanceInternal(node, key, path)`
+Same shape, but internal mechanics differ:
+- **Rotation (borrow):** rotate *through the parent* — the parent separator descends
+  into `node`, the sibling's boundary key ascends to replace it, and the sibling's
+  boundary child pointer moves across. Pages are rebuilt via `rebuildInternal`.
+- **Merge:** the surviving node holds `[left keys] + [parent separator] + [right
+  keys]` with all children concatenated; the separator is **pulled down** from the
+  parent. Then `deleteInternalEntry` on the parent and recurse / collapse the root,
+  exactly like the leaf case.
+
+`node` is caller-owned (the caller unpins it); `rebalanceInternal` unpins only the
+parent and siblings it fetches. All `FreePage` calls happen at tail positions, and
+freeing a still-pinned dead page is safe because `pool.FreePage` drops it from the
+cache (the later `UnpinPage` no-ops). See [freelist.md](freelist.md).
+
+---
+
+## Scan
+
+### `Scan(start, end) (Iterator, error)`
+Positions a cursor: `findLeaf(start)` (or the leftmost leaf if `start == nil`),
+fetch+**pin** that leaf, and set the start slot via `binarySearchKeys(.., true)`.
+Returns a `*leafIterator` that owns the pin until `Close`.
+
+### `leafIterator`
+Holds `pool`, the current `pageID`/`node`, the `slot`, the exclusive `end` bound,
+and a `closed` flag.
+- **`Next()`** — skip exhausted/empty leaves by following `rightSibling` (unpin the
+  old leaf, pin the next; `next == 0` → close + `io.EOF`). Read the entry; if
+  `end != nil && key >= end`, close + `io.EOF` (bound is exclusive). **Copy** the
+  key/value before returning (the page is unpinned on the next sibling cross or
+  `Close`), then advance `slot`.
+- **`Close()`** — idempotent; unpins the currently-held leaf.
+
+Invariant: exactly one leaf pinned between `Next` calls, released on every exit
+path (sibling cross, bound hit, end of chain, `Close`).
 
 ---
 
 ## Search helpers
 
-### `findLeaf(key)` / `findLeafRecursive(pageNum, path, key)`
-Walks from the root to the leaf that should contain `key`. At each internal node
-it scans keys left to right and descends into the first child whose separator is
-greater than `key` (or the last child if none is), accumulating the path of
-internal page IDs. Equality with a separator routes **right**, which is correct:
-the separator equals the first key of the right subtree's leaf.
-
-### `binarySearchKeys(node, key, leaf bool) int`
-Binary search returning the insertion index (`low`) where `key` belongs, or the
-index of an exact match. `leaf == true` compares via `leafKey`; `false` via
-`internalKey`. Relies on `bytes.Compare` returning exactly -1/0/1.
-
-### `decodeNodeNum(pageNum) (*Node, error)`
-Reads a page through the pager and wraps it as a `Node`. This is the single choke
-point that will switch to `BufferPool.FetchPage` when the pool is wired in.
-
----
-
-## Not yet implemented
-
-| Method | Plan |
-|--------|------|
-| `Get(key)` | Reuse `findLeaf` + `binarySearchKeys(.., true)`; return the value or `ErrNotFound`. (Needs an exported `ErrNotFound`.) |
-| `Scan(start, end)` | Find the start leaf, return an iterator that walks the right-sibling chain yielding entries until it passes `end`. |
-| `Delete(key)` | Remove the leaf entry; on underflow borrow from a sibling, else merge and remove the separator from the parent, cascading upward. Frees emptied pages to the [Freelist](freelist.md). |
-
----
-
-## Known open items (insert path)
-
-- `splitInternal` unfinished (see above) and `pushUp` still calls `splitLeaf` for
-  full internal parents.
-- `makeNewInternalHeader` missing.
-- Duplicate keys are not rejected — `Insert` will store a second entry for a key
-  that already exists. Primary keys are meant to be unique.
-- The buffer pool is not used; every traversal hits the pager directly.
+- **`findLeaf(key)` / `findLeafRecursive`** — walk root→leaf, descending into the
+  first child whose separator exceeds `key` (equality routes right, which is correct
+  for a B+ tree), accumulating the internal path. Unpins each node as it descends.
+- **`binarySearchKeys(node, key, leaf)`** — returns the insertion index / exact-match
+  index. `leaf == true` compares via `leafKey`, else `internalKey`.
 
 ---
 
 ## Integration
 
-- **Below:** [`btree_node.go`](btree-node.md) for page layout; [Pager](pager.md)
-  (eventually [BufferPool](buffer-pool.md)) for I/O; [Freelist](freelist.md) for
-  page reuse once `Delete` exists.
+- **Below:** [`btree_node.go`](btree-node.md) for page layout; the
+  [BufferPool](buffer-pool.md) for all I/O, allocation, and frees; the freelist
+  (in the pager) reclaims merged-away pages.
 - **Above:** the catalog and executor (later phases) treat each table/index as a
   `BTree` of serialized rows keyed by primary key.
+
+> Open item: `FreePage` for the freelist is wired in, but `pager.go`'s I/O is still
+> `Seek`-based; and the Insert path's split decision uses the leaked free-space
+> pointer rather than live bytes, so a heavily delete-then-insert leaf can split
+> slightly earlier than necessary (correct, just not optimal).

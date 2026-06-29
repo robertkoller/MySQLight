@@ -16,17 +16,19 @@ const magicByte = "MYSQLIGHT"
 //   11–14 page count (uint32)
 //   15–18 catalog root page ID (uint32)
 //   19–26 last checkpointed WAL LSN (uint64)
+//   27-30 freeListHead (uint32)
 
 type Pager struct {
-	pages     *os.File
-	pageCount uint32
+	pages        *os.File
+	freeListHead uint32
+	pageCount    uint32
 }
 
 // createHeader builds a fresh PageSize-byte slice formatted as the database header page.
 // It writes the magic string at offset 0, the page size at offset 9, the initial page count
 // at offset 11, the catalog root page ID at offset 15, and the WAL LSN at offset 19.
 // All multi-byte integers are encoded in big-endian byte order.
-func createHeader(pageCount uint32, cataLogID uint32, WAL_LSN uint64) []byte {
+func createHeader(pageCount uint32, cataLogID uint32, WAL_LSN uint64, freeListHead uint32) []byte {
 	header := make([]byte, PageSize)
 
 	copy(header[0:], []byte(magicByte))
@@ -35,6 +37,7 @@ func createHeader(pageCount uint32, cataLogID uint32, WAL_LSN uint64) []byte {
 	binary.BigEndian.PutUint32(header[11:], pageCount)
 	binary.BigEndian.PutUint32(header[15:], cataLogID)
 	binary.BigEndian.PutUint64(header[19:], WAL_LSN)
+	binary.BigEndian.PutUint32(header[27:], freeListHead)
 
 	return header
 
@@ -58,7 +61,7 @@ func Open(path string) (*Pager, error) {
 	}
 
 	if info.Size() == 0 {
-		if _, err = file.Write(createHeader(1, 0, 0)); err != nil {
+		if _, err = file.Write(createHeader(1, 0, 0, 0)); err != nil {
 			return nil, err
 		}
 		return &Pager{pages: file, pageCount: 1}, nil
@@ -73,8 +76,9 @@ func Open(path string) (*Pager, error) {
 		return nil, errors.New("invalid database file: bad magic bytes")
 	}
 
-	pageCount := binary.BigEndian.Uint32(buffer[11:15])
-	return &Pager{pages: file, pageCount: pageCount}, nil
+	pageCount := binary.BigEndian.Uint32(buffer[11:])
+	freeListPage := binary.BigEndian.Uint32(buffer[27:])
+	return &Pager{pages: file, freeListHead: freeListPage, pageCount: pageCount}, nil
 }
 
 // ReadPage reads exactly PageSize bytes from the page identified by pageID and returns
@@ -120,6 +124,19 @@ func (p *Pager) WritePage(pageID uint32, data []byte) error {
 // so that the new page survives a restart. AllocatePage does not write any content to the new
 // page — that is the caller's responsibility.
 func (p *Pager) AllocatePage() (uint32, error) {
+	if p.freeListHead != 0 {
+		id := p.freeListHead
+		buffer, err := p.ReadPage(id)
+		if err != nil {
+			return 0, err
+		}
+
+		p.freeListHead = binary.BigEndian.Uint32(buffer[0:])
+		if err := p.writeFreeListHead(); err != nil {
+			return 0, err
+		}
+		return id, nil
+	}
 	newID := p.pageCount
 
 	// This section makes it so that the file is immediately readable
@@ -146,8 +163,15 @@ func (p *Pager) AllocatePage() (uint32, error) {
 // Rather than shrinking the file, freed pages are tracked in the freelist (freelist.go) and
 // handed out again when new pages are needed, which avoids fragmentation and expensive file truncation.
 func (p *Pager) FreePage(pageID uint32) error {
-	// TODO: delegate to the Freelist (freelist.go)
-	panic("not implemented")
+	buffer := make([]byte, PageSize)
+	binary.BigEndian.PutUint32(buffer[0:], p.freeListHead)
+
+	if err := p.WritePage(pageID, buffer); err != nil {
+		return err
+	}
+
+	p.freeListHead = pageID
+	return p.writeFreeListHead()
 }
 
 // PageCount returns the number of pages currently allocated in the database file,
@@ -167,4 +191,12 @@ func (p *Pager) Close() error {
 		return err
 	}
 	return nil
+}
+
+func (p *Pager) writeFreeListHead() error {
+	p.pages.Seek(27, 0)
+	bytes := make([]byte, 4)
+	binary.BigEndian.PutUint32(bytes, p.freeListHead)
+	_, err := p.pages.Write(bytes)
+	return err
 }

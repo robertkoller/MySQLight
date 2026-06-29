@@ -2,8 +2,8 @@
 
 A B+ tree node is exactly one 4096-byte page. This file defines how the raw bytes
 of a page are interpreted as either a **leaf** or an **internal** node, and the
-read/write helpers the tree uses. It does not contain any tree logic (no traversal,
-no splitting) — only the per-page byte format.
+read/write helpers the tree uses. It contains no tree logic (no traversal, no
+splitting/merging decisions) — only the per-page byte format and primitives.
 
 ---
 
@@ -21,12 +21,12 @@ const slotStart = 9   // byte offset where a LEAF's slot array begins
 type Node struct {
     pageID   uint32
     nodeType NodeType
-    data     []byte    // the raw page bytes (length PageSize)
+    data     []byte    // the raw page bytes (length PageSize), aliases the cached page
 }
 ```
 
-`Node` is a thin wrapper over the page bytes; all accessors read/write directly
-into `data`. Integers are big-endian throughout.
+`Node` is a thin wrapper over the page bytes; accessors read/write directly into
+`data`. Integers are big-endian throughout.
 
 ---
 
@@ -42,17 +42,9 @@ into `data`. Integers are big-endian throughout.
 [ key/value data grows ← downward from the end of the page ]
 ```
 
-**Slot entry (8 bytes), kept in sorted key order:**
-
-| Bytes | Field |
-|-------|-------|
-| 0–1 | keyOffset (uint16) |
-| 2–3 | keyLen (uint16) |
-| 4–5 | valueOffset (uint16) |
-| 6–7 | valueLen (uint16) |
-
-The slot array grows **up** from offset 9; key/value bytes grow **down** from
-4096. They meet when the page is full.
+**Slot entry (8 bytes), kept in sorted key order:** `keyOffset, keyLen,
+valueOffset, valueLen` (each uint16). The slot array grows **up** from offset 9;
+key/value bytes grow **down** from 4096. They meet when the page is full.
 
 ---
 
@@ -67,92 +59,91 @@ The slot array grows **up** from offset 9; key/value bytes grow **down** from
 [ key bytes grow ← downward from the end of the page ]
 ```
 
-**Key slot entry (4 bytes):** `keyOffset (uint16), keyLen (uint16)`.
-
-For `n` keys there are always `n+1` child pointers. Child `i` holds all keys `x`
-with `key[i-1] ≤ x < key[i]`. Internal nodes store **no values** and **no
-right-sibling** — they are pure routers.
+**Key slot entry (4 bytes):** `keyOffset, keyLen` (uint16). For `n` keys there are
+always `n+1` child pointers; child `i` holds keys `x` with `key[i-1] ≤ x < key[i]`.
+Internal nodes store **no values** and **no right-sibling** — pure routers.
 
 > **Dynamic slot base.** The key slot array starts at `5 + (keyCount+1)*4`. Adding
 > a child pointer shifts this base right by 4 bytes, so `internalKey` recomputes
-> the base from the live `keyCount` on every call, and `insertInternalEntry` must
-> shift existing key slots to keep them aligned with the new base.
+> the base from the live `keyCount` on every call, and `insertInternalEntry` shifts
+> existing key slots to keep them aligned.
 
 ---
 
-## Header / counter accessors
+## Headers & counters
 
 | Method | What it does |
 |--------|--------------|
-| `decodeNode(pageID, data) (*Node, error)` | Wraps raw bytes in a `Node`; errors if byte 0 isn't a known node type. |
-| `keyCount() uint16` | Reads the key count at offset 1. |
-| `findFreeSpace() uint16` | Reads `freeSpacePtr` at offset 3. |
-| `newFreeSpace(ptr)` | Writes `freeSpacePtr`. |
-| `incrementKeyCount()` | `keyCount++`. |
-| `isLeaf() bool` | `nodeType == NodeLeaf`. |
 | `makeNewLeafHeader() []byte` | Fresh empty leaf page: type byte, `keyCount = 0`, `freeSpacePtr = PageSize`. |
-
-> **Missing helper:** there is no `makeNewInternalHeader()` yet. `splitInternal`
-> needs it — same as `makeNewLeafHeader` but with `NodeInternal` and no sibling
-> field.
+| `makeNewInternalHeader() []byte` | Fresh empty internal page: type byte, `keyCount = 0`, `freeSpacePtr = PageSize`. |
+| `decodeNode(pageID, data) (*Node, error)` | Wraps raw bytes in a `Node`; errors if byte 0 isn't a known node type. |
+| `keyCount() uint16` / `incrementKeyCount()` / `decrementKeyCount()` | Read/adjust the key count at offset 1. |
+| `findFreeSpace() uint16` / `newFreeSpace(ptr)` | Read/write `freeSpacePtr` at offset 3. |
+| `isLeaf() bool` | `nodeType == NodeLeaf`. |
+| `rightSibling() uint32` / `setRightSibling(id)` | Get/set the 4-byte sibling pointer at offset 5. **Leaf-only** — on an internal node offset 5 is `child[0]`. |
 
 ---
 
 ## Leaf accessors
 
-### `insertLeafEntry(key, value []byte, slotIndex int)`
-1. Pack the value at `freeSpacePtr - len(value)`, then the key just below it;
-   update `freeSpacePtr` to the key's offset.
-2. Build the 8-byte slot (key/value offsets + lengths).
-3. Shift slots `[slotIndex..]` right by 8 bytes (Go's `copy` is memmove-safe for
-   the overlap) and write the new slot at `slotIndex`.
-4. `incrementKeyCount()`.
-
-Overflow is **not** checked here — the caller (`BTree.Insert`) checks before
-calling and splits if needed.
-
-### `leafKey(i) []byte` / `leafValue(i) []byte`
-Read slot `i` (at `9 + i*8`) and return the key (offset/len at +0/+2) or value
-(offset/len at +4/+6) bytes from within the page.
-
-### `rightSibling() uint32` / `setRightSibling(pageID)`
-Get/set the 4-byte sibling pointer at offset 5. Leaf-only; on an internal node
-offset 5 is `child[0]`, so don't call these on internal nodes.
+- **`insertLeafEntry(key, value, slotIndex)`** — pack value then key at the
+  descending `freeSpacePtr`, build the 8-byte slot, shift slots `[slotIndex..]`
+  right by 8, write the new slot, `keyCount++`. Overflow is the caller's check.
+- **`deleteLeafEntry(slotIndex)`** — remove the slot by shifting the slots above it
+  down by 8, `keyCount--`. **Does not reclaim** the key/value bytes (the data
+  region's `freeSpacePtr` only moves down) — that dead space is reclaimed by a
+  later rebuild/compaction. This is *the* subtlety behind the delete-path helpers
+  below.
+- **`leafKey(i) []byte` / `leafValue(i) []byte`** — read slot `i` and return the
+  bytes from within the page (a slice into `data`, so copy before the page can be
+  unpinned).
+- **`leafLiveBytes() int`** — `slotStart + keyCount*8 + Σ(keyLen+valueLen)`. The
+  *live* footprint (ignores dead bytes), used by `Delete` to detect underflow and
+  to fit-check merges.
 
 ---
 
 ## Internal accessors
 
-### `insertInternalEntry(key []byte, slotIndex int, rightChildID uint32)`
-Inserts a separator key at `slotIndex` and its right child at child position
-`slotIndex+1`. Because adding a child pointer grows the child region by 4 bytes,
-the key slots must move to stay aligned with the dynamic base. The net effect:
+- **`insertInternalEntry(key, slotIndex, rightChildID)`** — inserts a separator at
+  `slotIndex` and its right child at child position `slotIndex+1`, shifting key
+  slots and child pointers to keep the dynamic base aligned. Verified for front,
+  middle, and end insertions.
+- **`deleteInternalEntry(separatorKeyIndex, childIndex)`** — rebuilds the node from
+  its keys/children minus the named separator key and child pointer (compacting in
+  the process).
+- **`replaceInternalKey(i, newKey)`** — replaces separator `i` by **rebuilding** the
+  node. It does *not* write in place: the data region only grows downward, so
+  repeated in-place replacements (one per leaf-borrow and rotation) would leak the
+  old key bytes and eventually march `freeSpacePtr` into the child/slot region.
+  Rebuilding compacts on every call.
+- **`internalKey(i) []byte`** — slot base `5 + (keyCount+1)*4`, read slot `i`.
+- **`childPageID(i) uint32`** — uint32 child pointer at `5 + i*4`.
+- **`internalLiveBytes() int`** — `5 + (keyCount+1)*4 + keyCount*4 + Σ keyLen`. The
+  internal analogue of `leafLiveBytes`, used to detect internal underflow.
 
-1. Pack the key bytes at `freeSpacePtr - len(key)`.
-2. Shift key slots `[slotIndex..keyCount-1]` right by 8 (4 for the new child
-   pointer + 4 for the new key-slot gap).
-3. Shift key slots `[0..slotIndex-1]` right by 4 (child pointer growth only).
-4. Shift child pointers `[slotIndex+1..keyCount]` right by 4 to open the gap.
-5. Write `rightChildID` at child position `slotIndex+1`.
-6. Write the new key slot at `newSlotsBase + slotIndex*4`, where
-   `newSlotsBase = 5 + (keyCount+2)*4`.
-7. `incrementKeyCount()`.
+---
 
-Verified for front, middle, and end (append) insertions. Like the leaf version,
-overflow is the caller's responsibility.
+## Rebuild / compaction helpers
 
-### `internalKey(i) []byte`
-Computes the slot base `5 + (keyCount+1)*4`, reads slot `i`'s offset/len at
-`base + i*4`, and returns the key bytes.
+Because `deleteLeafEntry` and in-place key replacement leave dead bytes, the
+delete path rebuilds pages from their live contents to reclaim space and keep the
+physical layout consistent with `leafLiveBytes`/`internalLiveBytes`.
 
-### `childPageID(i) uint32`
-Reads the uint32 child pointer at `5 + i*4`.
+- **`rebuildLeaf(keys, values)`** — rewrites the leaf to hold exactly the given
+  pairs, packed with no dead space; preserves the right-sibling pointer. Used by
+  leaf merges (combine two nodes' live entries into the survivor).
+- **`compactLeaf()`** — `rebuildLeaf` from the node's *own* live entries. Used
+  before a borrow appends an entry, so the append can't overflow a fragmented page.
+- **`rebuildInternal(keys, children)`** — rewrites the internal node to hold exactly
+  the given separators and `len(keys)+1` children. Used by internal rotations and
+  merges (and by `deleteInternalEntry`/`replaceInternalKey`).
 
 ---
 
 ## Overflow math (used by the caller, documented here for reference)
 
-**Leaf** — free gap before insert and cost of one entry:
+**Leaf** — free gap and cost of one entry:
 ```
 freeGap = freeSpacePtr - (slotStart + keyCount*8)
 needed  = len(key) + len(value) + 8        // key + value + one 8-byte slot
@@ -172,14 +163,7 @@ needed split.
 
 ---
 
-## Stale comments to ignore
-
-The doc comments above `rightSibling` and `childPageID` say "offset 3"; the code
-correctly uses offset 5. The code is right, the comments are wrong.
-
----
-
 ## Integration
 
-`btree_node.go` is pure byte-layout plumbing. It is consumed entirely by
+`btree_node.go` is pure byte-layout plumbing, consumed entirely by
 [`btree.go`](btree.md); it does no I/O and never touches the pager or buffer pool.

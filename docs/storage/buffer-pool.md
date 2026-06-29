@@ -3,9 +3,8 @@
 Reading from disk on every tree traversal is too slow, and `Pager.ReadPage`
 allocates a new buffer each call. The buffer pool keeps recently used pages in
 memory, hands out shared references to them, and writes them back to disk lazily.
-
-It sits between the [BTree](btree.md) and the [Pager](pager.md) in the intended
-design. (Today the tree bypasses it — see *Integration*.)
+It sits between the [BTree](btree.md) and the [Pager](pager.md), and the tree
+talks **only** to the pool — never the pager directly.
 
 ---
 
@@ -28,77 +27,87 @@ type BufferPool struct {
 }
 ```
 
-`Data` is **shared**: when a caller mutates it, it mutates the cached copy
-directly. That is the whole point — but it means callers must signal "I changed
-this" via `UnpinPage(id, true)` so the page is eventually flushed.
+`Data` is **shared**: a caller that mutates it mutates the cached copy directly.
+That is the point — but it means callers must signal "I changed this" via
+`UnpinPage(id, true)` so the page is eventually flushed.
 
 ---
 
 ## Functions
 
-### `NewBufferPool(pager *Pager, capacity int) *BufferPool`
-Allocates the maps and the LRU list and stores the pager and capacity.
+### `NewBufferPool(pager, capacity) *BufferPool`
+Allocates the maps and the LRU list; stores the pager and capacity.
 
-### `FetchPage(pageID uint32) (*Page, error)`
-Returns the requested page, pinned (`pinCount` incremented).
-- **Cache hit:** move it to the front of the LRU list (most recently used),
-  increment the pin count, return it.
-- **Cache full** (`len >= capacity`): walk the LRU list from the back looking for
-  an **unpinned** page. If every page is pinned, return an error. Otherwise, if
-  the victim is dirty, flush it via `pager.WritePage`, then remove it from the
-  list and both maps.
-- **Cache miss:** load the page via `pager.ReadPage`, wrap it in a `Page` with
-  `pinCount = 1`, insert at the front of the LRU list and into the maps.
+### `FetchPage(pageID) (*Page, error)`
+Returns the requested page, pinned (`pinCount`++).
+- **Cache hit:** move it to the front of the LRU list, increment the pin count,
+  return it.
+- **Cache full** (`len >= capacity`): walk the LRU list from the back for an
+  **unpinned** victim. If every page is pinned, return an error. If the victim is
+  dirty, flush it via `pager.WritePage`, then remove it from the list and both maps.
+- **Cache miss:** load via `pager.ReadPage`, wrap in a `Page` with `pinCount = 1`,
+  insert at the front of the LRU list and into the maps.
 
-### `UnpinPage(pageID uint32, dirty bool) error`
-Signals the caller is done with a page.
-- Errors if the page isn't in the pool.
+### `UnpinPage(pageID, dirty) error`
+Signals the caller is done.
+- Returns an error if the page isn't in the pool (callers that may have freed the
+  page intentionally ignore this).
 - Decrements `pinCount` (guarded so it never goes below 0).
-- If `dirty` is true, marks the page dirty. The dirty flag is sticky — it is only
-  cleared by a flush, never by `dirty == false`, so a page stays dirty until
-  written.
-- When `pinCount` reaches 0, the page is moved to the back of the LRU list,
-  making it the next eviction candidate.
+- If `dirty`, sets the dirty flag. The flag is **sticky** — cleared only by a
+  flush, never by `dirty == false`.
+
+> Note: `UnpinPage` does not reorder the LRU list; recency is tracked by
+> `FetchPage` (move-to-front on access). Eviction picks the least-recently-*fetched*
+> unpinned page.
 
 ### `FlushAll() error`
 Writes every dirty page to disk via the pager and marks it clean. Used at
 checkpoint and on close so no modified data is left only in memory.
+
+### `AllocatePage() (uint32, error)`
+Delegates to `pager.AllocatePage` (which itself prefers the freelist). The caller
+then `FetchPage`es the returned ID and overwrites it with a fresh node header.
+This works for both brand-new pages (the pager zeroes them on disk before
+returning) and recycled pages (they already exist on disk).
+
+### `FreePage(pageID) error`
+Drops the page from the cache **without flushing** (it's dead), then calls
+`pager.FreePage` to push it onto the freelist. Dropping first is essential — see
+the gotcha in [freelist.md](freelist.md). Safe to call on a still-pinned page: the
+frame is removed, so a later `UnpinPage` simply no-ops.
+
+### `fetchNode(id) (*Page, *Node, error)`
+Convenience wrapper: `FetchPage` then `decodeNode(id, page.Data)`. The returned
+`Node` aliases the cached page buffer, so node mutations edit the cache in place.
+This is the tree's main entry point into the pool.
 
 ---
 
 ## LRU & pin semantics
 
 - Front of `lruList` = most recently used; back = least recently used.
-- Eviction only ever removes an **unpinned** page (a pinned page is in active use
-  and must not disappear from under its holder).
-- A page becomes an eviction candidate the moment its pin count hits 0
-  (`UnpinPage` moves it to the back).
+- Eviction only ever removes an **unpinned** page (a pinned page is in active use).
+- Capacity must comfortably exceed the maximum number of pages pinned at once.
+  The deepest pin nesting is in `rebalanceInternal`, which holds a node + parent +
+  up to two siblings per level while recursing up the path — keep capacity well
+  above `tree height × 4`.
 
 ---
 
-## Open issues (as of this writing)
+## Aliasing gotcha (relevant to the tree)
 
-- **`FlushAll` pin detection is buggy.** It sets `hasPins = page.pinCount > 0`
-  inside the loop, overwriting it each iteration, so the final value reflects only
-  the last dirty page (and map iteration order is random). It should OR-accumulate:
-  `hasPins = hasPins || page.pinCount > 0`. Separately, decide whether flushing a
-  still-pinned page is an error at all, since the data is written regardless.
-- **No `NewPage` path.** Once the tree uses the pool, allocating a brand-new page
-  can't go through `FetchPage` (that calls `ReadPage` on a page the file doesn't
-  hold yet → EOF). The pool will need a method that allocates via the pager and
-  installs a fresh, pinned, dirty frame without reading disk.
+Code that does `node.data = makeNewLeafHeader()` swaps the slice and breaks the
+alias to the cached buffer; it must copy back into `page.Data` before unpinning.
+The split paths do exactly this (build a fresh buffer, then `copy(page.Data, …)`),
+and the delete-path rebuild helpers (`rebuildLeaf`, `rebuildInternal`,
+`compactLeaf`) `copy` into `n.data` in place — so the cache never holds a stale
+slice.
 
 ---
 
 ## Integration
 
-- **Below:** calls `Pager.ReadPage`/`WritePage`.
-- **Above:** intended to be the only thing the [BTree](btree.md) talks to for
-  reading/writing nodes. The swap from "pager-direct" to "pool" changes the
-  tree's contract:
-  - `ReadPage` (copy) → `FetchPage` (shared, pinned).
-  - explicit `WritePage` → mutate in place + `UnpinPage(id, true)`.
-  - **Gotcha:** code that does `node.data = makeNewLeafHeader()` (reassigning the
-    slice) breaks the alias to the cached buffer. Under the pool, such code must
-    rewrite the existing buffer in place instead of swapping the slice, or the
-    cache will flush stale bytes.
+- **Below:** calls `Pager.ReadPage`/`WritePage`/`AllocatePage`/`FreePage`.
+- **Above:** the [BTree](btree.md) reads and writes every node through
+  `fetchNode`/`FetchPage` + `UnpinPage`, allocates via `AllocatePage`, and frees
+  via `FreePage`. Every `FetchPage` is balanced by exactly one `UnpinPage`.

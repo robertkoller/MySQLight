@@ -2,7 +2,7 @@
 
 The pager is the lowest layer of the storage engine. It treats the database file
 as a flat array of fixed-size **pages** (4096 bytes) and exposes read/write/
-allocate operations addressed by page ID. It knows nothing about B+ trees or
+allocate/free operations addressed by page ID. It knows nothing about B+ trees or
 what lives inside a page — only page 0, the header, has meaning to it.
 
 ```
@@ -31,6 +31,7 @@ file on disk:
 | 11–14 | 4 B | Page count (uint32) |
 | 15–18 | 4 B | Catalog root page ID (uint32) |
 | 19–26 | 8 B | Last checkpointed WAL LSN (uint64) |
+| 27–30 | 4 B | **Freelist head** page ID (uint32, 0 = empty) |
 
 All multi-byte integers are **big-endian**, consistently across the whole engine.
 
@@ -40,38 +41,36 @@ All multi-byte integers are **big-endian**, consistently across the whole engine
 
 ```go
 type Pager struct {
-    pages     *os.File   // the open database file
-    pageCount uint32      // number of pages currently in the file (incl. header)
+    pages        *os.File   // the open database file
+    freeListHead uint32     // head of the free-page chain (0 = none)
+    pageCount    uint32     // number of pages currently in the file (incl. header)
 }
 ```
 
 `pageCount` is the in-memory authority for how many pages exist; it is mirrored
-into the header at offset 11 whenever it changes.
+into the header at offset 11 whenever it changes. `freeListHead` is mirrored at
+offset 27.
 
 ---
 
 ## Functions
 
-### `createHeader(pageCount, catalogID, walLSN) []byte`
-Builds a fresh 4096-byte header page: writes the magic string, page size, page
-count, catalog root ID, and WAL LSN at their offsets. Returns the full page.
+### `createHeader(pageCount, catalogID, walLSN, freeListHead) []byte`
+Builds a fresh 4096-byte header page with all five fields written at their
+offsets. Returns the full page.
 
 ### `Open(path string) (*Pager, error)`
 Opens the file (creating it if absent, mode `0644`).
 - **New file (size 0):** writes a fresh header with `pageCount = 1` (the header
-  page itself) and returns a `Pager` with `pageCount = 1`.
+  page itself) and `freeListHead = 0`.
 - **Existing file:** reads page 0, verifies the magic bytes (error if mismatched),
-  and loads `pageCount` from the header.
+  and loads `pageCount` and `freeListHead` from the header.
 
 ### `ReadPage(pageID uint32) ([]byte, error)`
-Bounds-checks `pageID < pageCount`, seeks to `pageID * PageSize`, and reads
-exactly `PageSize` bytes into a **freshly allocated** slice. Each call allocates
-a new buffer — this is why the buffer pool exists (to avoid re-reading and
+Bounds-checks `pageID < pageCount`, seeks to `int64(pageID) * PageSize`, and reads
+exactly `PageSize` bytes into a **freshly allocated** slice. Each call allocates a
+new buffer — this is why the buffer pool exists (to avoid re-reading and
 re-allocating hot pages).
-
-> **Open issue:** the seek offset is computed as `int64(pageID*PageSize)`, which
-> multiplies in `uint32` and overflows past ~4 GB. `WritePage` does it correctly
-> as `int64(pageID)*PageSize`. `ReadPage` should match.
 
 ### `WritePage(pageID uint32, data []byte) error`
 Bounds-checks `pageID`, rejects `data` whose length isn't exactly `PageSize`
@@ -79,34 +78,45 @@ Bounds-checks `pageID`, rejects `data` whose length isn't exactly `PageSize`
 and writes. The caller is responsible for forming a complete page first.
 
 ### `AllocatePage() (uint32, error)`
-Reserves the next page at the end of the file: returns the current `pageCount`
-as the new ID, increments `pageCount`, and persists the new count to the header
-(offset 11).
+Hands out a page, preferring reuse over growth:
+- **Freelist non-empty (`freeListHead != 0`):** pop the head — read the freed
+  page's first 4 bytes to find the next free page, set `freeListHead` to it,
+  persist, and return the popped ID.
+- **Freelist empty:** extend the file — return the current `pageCount` as the new
+  ID, write a zeroed page there (so it's immediately readable), increment
+  `pageCount`, and persist the count.
 
-- It does **not** write any content to the new page — that's the caller's job.
-- It does **not** physically extend the file; the file only grows when the new
-  page is actually written. Therefore a caller must `WritePage` a freshly
-  allocated page before any `ReadPage`, or the read will hit EOF.
+Does not write node content — that's the caller's job (it overwrites the page with
+a fresh header).
 
-### `FreePage(pageID uint32) error` — stub
-Intended to hand the page to the [Freelist](freelist.md) for reuse rather than
-shrinking the file. Not yet implemented.
+### `FreePage(pageID uint32) error`
+Pushes the page onto the freelist stack: writes the current `freeListHead` into
+the freed page's first 4 bytes (its "next" link), sets `freeListHead = pageID`,
+and persists the head. See [freelist.md](freelist.md) for the full mechanism and
+the buffer-pool drop that must accompany it.
+
+### `writeFreeListHead() error`
+Persists `freeListHead` to header offset 27. Called by `AllocatePage`/`FreePage`.
 
 ### `PageCount() uint32`
 Returns the current page count (including page 0).
 
 ### `Close() error`
-`Sync()` then `Close()` the file, so OS-buffered writes are durably flushed
-before the handle is released.
+`Sync()` then `Close()` the file, so OS-buffered writes are durably flushed before
+the handle is released.
 
 ---
 
 ## Integration
 
-- **Above:** the [BufferPool](buffer-pool.md) is the intended sole caller of
-  `ReadPage`/`WritePage`. (Today the [BTree](btree.md) also calls the pager
-  directly.)
-- **Allocation:** `AllocatePage` will become the fallback path for the
-  [Freelist](freelist.md) — the freelist hands out recycled IDs first and only
-  calls `AllocatePage` when it's empty.
+- **Above:** the [BufferPool](buffer-pool.md) is the caller of `ReadPage`/
+  `WritePage`. The [BTree](btree.md) goes through the pool, never the pager
+  directly.
+- **Allocation/free:** `AllocatePage` and `FreePage` *are* the freelist — there is
+  no separate freelist module. The pool's `AllocatePage`/`FreePage` wrap these
+  (the latter also dropping the cached frame).
 - The pager is the only component that touches the `*os.File`.
+
+> Minor note: I/O uses `Seek` + `Read`/`Write` on a shared file offset, which is
+> fine single-threaded; `ReadAt`/`WriteAt` would be cleaner and concurrency-safe
+> if that ever matters.

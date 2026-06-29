@@ -508,3 +508,136 @@ func TestBTreeScanEmptyTreeAndEarlyClose(t *testing.T) {
 	}
 	assertNoPins(t, pool)
 }
+
+// Freelist
+
+func TestPagerFreelistReuse(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "fl.db")
+	pager, _ := Open(path)
+	defer pager.Close()
+
+	a, _ := pager.AllocatePage() // 1
+	b, _ := pager.AllocatePage() // 2
+	c, _ := pager.AllocatePage() // 3
+	if a != 1 || b != 2 || c != 3 {
+		t.Fatalf("unexpected ids: %d %d %d", a, b, c)
+	}
+	countBefore := pager.PageCount()
+
+	if err := pager.FreePage(b); err != nil {
+		t.Fatalf("FreePage: %v", err)
+	}
+	if err := pager.FreePage(c); err != nil {
+		t.Fatalf("FreePage: %v", err)
+	}
+
+	// LIFO: last freed (c) comes back first, then b — without growing the file
+	if got, _ := pager.AllocatePage(); got != c {
+		t.Fatalf("reuse 1 = %d, want %d", got, c)
+	}
+	if got, _ := pager.AllocatePage(); got != b {
+		t.Fatalf("reuse 2 = %d, want %d", got, b)
+	}
+	if pager.PageCount() != countBefore {
+		t.Fatalf("PageCount grew to %d while reusing freed pages (want %d)", pager.PageCount(), countBefore)
+	}
+
+	// freelist empty again -> next allocate extends the file
+	if got, _ := pager.AllocatePage(); got != countBefore {
+		t.Fatalf("post-freelist allocate = %d, want %d", got, countBefore)
+	}
+	if pager.PageCount() != countBefore+1 {
+		t.Fatalf("PageCount = %d, want %d", pager.PageCount(), countBefore+1)
+	}
+}
+
+func TestPagerFreelistDurable(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "fldur.db")
+	pager, _ := Open(path)
+	pager.AllocatePage()         // 1
+	b, _ := pager.AllocatePage() // 2
+	c, _ := pager.AllocatePage() // 3
+	pager.FreePage(b)
+	pager.FreePage(c) // head = c, c -> b
+	if err := pager.Close(); err != nil {
+		t.Fatalf("Close: %v", err)
+	}
+
+	re, err := Open(path)
+	if err != nil {
+		t.Fatalf("reopen: %v", err)
+	}
+	defer re.Close()
+	// the freelist head survived the reopen
+	if got, _ := re.AllocatePage(); got != c {
+		t.Fatalf("after reopen reuse = %d, want %d", got, c)
+	}
+	if got, _ := re.AllocatePage(); got != b {
+		t.Fatalf("after reopen reuse 2 = %d, want %d", got, b)
+	}
+}
+
+func TestBufferPoolFreePageDiscards(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "fldisc.db")
+	pager, _ := Open(path)
+	defer pager.Close()
+	pool := NewBufferPool(pager, 8)
+
+	id, _ := pool.AllocatePage()
+	page, _ := pool.FetchPage(id)
+	copy(page.Data, []byte("DEADBEEF"))
+	pool.UnpinPage(id, true) // now dirty in the pool
+
+	if err := pool.FreePage(id); err != nil {
+		t.Fatalf("FreePage: %v", err)
+	}
+	if _, ok := pool.frames[id]; ok {
+		t.Fatalf("freed page is still cached in the pool")
+	}
+	// FlushAll must NOT write the discarded dirty bytes over the freelist link
+	if err := pool.FlushAll(); err != nil {
+		t.Fatalf("FlushAll: %v", err)
+	}
+	got, _ := pager.ReadPage(id)
+	if bytes.HasPrefix(got, []byte("DEADBEEF")) {
+		t.Fatalf("discarded dirty page was flushed over the freelist link")
+	}
+}
+
+func TestBTreeFreelistRecycling(t *testing.T) {
+	pager, pool, tree := newTree(t, 128)
+
+	const n = 3000
+	for i := 0; i < n; i++ {
+		tree.Insert(bkey(i), bval(i))
+	}
+	peak := pager.PageCount()
+
+	for i := 0; i < n; i++ {
+		if err := tree.Delete(bkey(i)); err != nil {
+			t.Fatalf("delete %d: %v", i, err)
+		}
+	}
+	// deletes only free pages; the file never shrinks and never grows
+	if pager.PageCount() != peak {
+		t.Fatalf("PageCount changed during deletes: %d -> %d", peak, pager.PageCount())
+	}
+
+	// reinserting reuses freed pages from the freelist instead of growing the file.
+	// Without a freelist this would allocate ~peak brand-new pages (roughly doubling the
+	// file); with it, the count stays within a couple of pages of the peak.
+	for i := 0; i < n; i++ {
+		tree.Insert(bkey(i), bval(i))
+	}
+	if pager.PageCount() > peak+4 {
+		t.Fatalf("file grew despite the freelist (reuse not happening): peak=%d now=%d", peak, pager.PageCount())
+	}
+
+	for i := 0; i < n; i++ {
+		got, err := tree.Get(bkey(i))
+		if err != nil || !bytes.Equal(got, bval(i)) {
+			t.Fatalf("key %d wrong after recycle: err=%v", i, err)
+		}
+	}
+	assertNoPins(t, pool)
+}
