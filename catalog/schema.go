@@ -11,11 +11,11 @@ const (
 
 // Value holds a single typed cell value. Exactly one field is set.
 type Value struct {
-	// TODO: IsNull bool
-	// TODO: IntVal   int64
-	// TODO: FloatVal float64
-	// TODO: TextVal  string
-	// TODO: BlobVal  []byte
+	IsNull   bool
+	IntVal   int64
+	FloatVal float64
+	TextVal  string
+	BlobVal  []byte
 }
 
 type ColumnDef struct {

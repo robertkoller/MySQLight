@@ -245,6 +245,22 @@ func (t *BTree) Scan(start []byte, end []byte) (Iterator, error) {
 	return &leafIterator{pool: t.pool, pageID: startID, node: startNode, slot: slot, end: end, closed: false}, nil
 }
 
+// AllocateNewRoot allocates and formats a fresh leaf page to serve as the root
+// of a new B+ tree, returning its page ID.
+func (t *BTree) AllocateNewRoot() (uint32, error) {
+	pageID, err := t.pool.AllocatePage()
+	if err != nil {
+		return 0, err
+	}
+	page, err := t.pool.FetchPage(pageID)
+	if err != nil {
+		return 0, err
+	}
+	copy(page.Data, makeNewLeafHeader())
+	t.pool.UnpinPage(pageID, true)
+	return pageID, nil
+}
+
 // finds the leaf for inserting given a specific key
 func (t *BTree) findLeaf(key []byte) (leafPageID uint32, path []uint32, err error) {
 	return t.findLeafRecursive(t.rootPageID, []uint32{}, key)
