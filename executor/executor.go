@@ -1,58 +1,257 @@
 package executor
 
-import "io"
+import (
+	"fmt"
+	"io"
+	"strings"
 
-var _ = io.EOF // ensure io is used
+	"github.com/robertkoller/MySQLight/catalog"
+	"github.com/robertkoller/MySQLight/parser"
+	"github.com/robertkoller/MySQLight/storage"
+)
 
 // Row is an ordered slice of values for one result row.
-// TODO: replace interface{} with a proper Value type from the catalog package.
-type Row []interface{}
+type Row []catalog.Value
 
 // Operator is the iterator interface every physical operator implements.
 type Operator interface {
-	Open() error          // initialise internal state, open child operators
-	Next() (Row, error)   // return the next row; return io.EOF when exhausted
-	Close() error         // release resources
+	Open() error        // initialise internal state, open child operators
+	Next() (Row, error) // return the next row; return io.EOF when exhausted
+	Close() error       // release resources
 }
 
 // Executor dispatches a parsed Statement to the correct execution path.
 type Executor struct {
-	// TODO: catalog reference — needed to look up table and index definitions
-	// TODO: txn reference    — needed to acquire locks before reads/writes
+	catalog *catalog.Catalog
+	pool    *storage.BufferPool
 }
 
-// NewExecutor initialises the executor with references to the catalog and transaction manager,
-// which are needed to look up table definitions and acquire locks before any read or write.
-func NewExecutor() *Executor {
-	// TODO: store catalog and txn manager references
-	panic("not implemented")
+// NewExecutor initialises the executor with references to the catalog and buffer pool.
+func NewExecutor(cat *catalog.Catalog, pool *storage.BufferPool) *Executor {
+	return &Executor{catalog: cat, pool: pool}
 }
 
-// Execute dispatches a parsed statement to the correct execution path. SELECT statements
-// are converted to a physical operator pipeline and all rows are collected into a slice.
-// DML statements (INSERT, UPDATE, DELETE) run their own execution logic directly. DDL
-// statements (CREATE TABLE/INDEX, DROP TABLE/INDEX) are delegated to the catalog. Transaction
-// statements (BEGIN, COMMIT, ROLLBACK) are forwarded to the transaction manager.
+// Execute dispatches a parsed statement to the correct execution path. SELECT
+// statements are converted to a physical operator pipeline and all rows are
+// collected. DDL delegates to the catalog. DELETE uses executeDelete. INSERT and
+// UPDATE are not yet implemented.
 func (e *Executor) Execute(stmt interface{}) ([]Row, error) {
-	// TODO: type-switch on stmt:
-	//   *parser.SelectStmt      → buildSelectPlan → collect all rows
-	//   *parser.InsertStmt      → executeInsert
-	//   *parser.UpdateStmt      → executeUpdate
-	//   *parser.DeleteStmt      → executeDelete
-	//   *parser.CreateTableStmt → catalog.CreateTable
-	//   *parser.CreateIndexStmt → catalog.CreateIndex
-	//   *parser.DropTableStmt   → catalog.DropTable
-	//   *parser.DropIndexStmt   → catalog.DropIndex
-	//   *parser.BeginStmt       → txn.Begin
-	//   *parser.CommitStmt      → txn.Commit
-	//   *parser.RollbackStmt    → txn.Rollback
-	//   *parser.AnalyzeStmt     → runAnalyze
-	panic("not implemented")
+	switch typed := stmt.(type) {
+	case *parser.SelectStmt:
+		pipeline, err := e.buildSelectPipeline(typed)
+		if err != nil {
+			return nil, err
+		}
+		return collectRows(pipeline)
+
+	case *parser.DeleteStmt:
+		return nil, e.executeDelete(typed)
+
+	case *parser.CreateTableStmt:
+		definition, err := astToTableDef(typed)
+		if err != nil {
+			return nil, err
+		}
+		return nil, e.catalog.CreateTable(definition)
+
+	case *parser.DropTableStmt:
+		return nil, e.catalog.DropTable(typed.Table)
+
+	case *parser.CreateIndexStmt:
+		definition := &catalog.IndexDef{
+			Name:       typed.Index,
+			TableName:  typed.Table,
+			ColumnName: typed.Column,
+			Unique:     typed.Unique,
+		}
+		return nil, e.catalog.CreateIndex(definition)
+
+	case *parser.DropIndexStmt:
+		return nil, e.catalog.DropIndex(typed.Index)
+
+	case *parser.InsertStmt:
+		return nil, e.executeInsert(typed)
+
+	case *parser.UpdateStmt:
+		return nil, e.executeUpdate(typed)
+
+	case *parser.BeginStmt, *parser.CommitStmt, *parser.RollbackStmt:
+		return nil, fmt.Errorf("transactions not yet implemented (Phase 4)")
+
+	case *parser.AnalyzeStmt:
+		return nil, fmt.Errorf("ANALYZE not yet implemented")
+
+	default:
+		return nil, fmt.Errorf("unknown statement type %T", stmt)
+	}
 }
 
-// collectRows opens an operator, drains it by calling Next until io.EOF is returned,
-// closes it, and returns all accumulated rows.
+// collectRows opens op, drains it to io.EOF, closes it, and returns all rows.
 func collectRows(op Operator) ([]Row, error) {
-	// TODO: op.Open(), loop op.Next() until io.EOF, op.Close(), return rows
-	panic("not implemented")
+	if err := op.Open(); err != nil {
+		return nil, err
+	}
+	var rows []Row
+	for {
+		row, err := op.Next()
+		if err == io.EOF {
+			break
+		}
+		if err != nil {
+			op.Close()
+			return nil, err
+		}
+		rows = append(rows, row)
+	}
+	if err := op.Close(); err != nil {
+		return nil, err
+	}
+	return rows, nil
+}
+
+// buildSelectPipeline constructs the physical operator tree for a SELECT statement.
+// Pipeline order: TableScan → Joins → Filter → Aggregate or (Sort → Project) → Limit.
+//
+// Known limitation: ORDER BY is applied before projection and references the
+// pre-projection column schema. ORDER BY on aggregate results is not yet supported.
+func (e *Executor) buildSelectPipeline(stmt *parser.SelectStmt) (Operator, error) {
+	definition, err := e.catalog.GetTable(stmt.From)
+	if err != nil {
+		return nil, fmt.Errorf("table %q not found: %w", stmt.From, err)
+	}
+
+	dataTree, err := storage.NewBTree(e.pool, definition.RootPageID)
+	if err != nil {
+		return nil, err
+	}
+
+	var pipeline Operator = NewTableScan(dataTree, definition.Columns)
+	currentColumns := append([]catalog.ColumnDef{}, definition.Columns...)
+
+	for _, join := range stmt.Joins {
+		rightDef, err := e.catalog.GetTable(join.Table)
+		if err != nil {
+			return nil, fmt.Errorf("joined table %q not found: %w", join.Table, err)
+		}
+		rightTree, err := storage.NewBTree(e.pool, rightDef.RootPageID)
+		if err != nil {
+			return nil, err
+		}
+		rightScan := NewTableScan(rightTree, rightDef.Columns)
+		pipeline = NewNestedLoopJoin(pipeline, rightScan, join.On, currentColumns, rightDef.Columns)
+		currentColumns = append(currentColumns, rightDef.Columns...)
+	}
+
+	if stmt.Where != nil {
+		pipeline = NewFilter(pipeline, stmt.Where, currentColumns)
+	}
+
+	if len(stmt.GroupBy) > 0 || hasAggregates(stmt.Columns) {
+		pipeline = NewAggregate(pipeline, stmt.GroupBy, stmt.Columns, currentColumns)
+	} else {
+		if len(stmt.OrderBy) > 0 {
+			pipeline = NewSort(pipeline, stmt.OrderBy, currentColumns)
+		}
+		if !isSelectStar(stmt.Columns) {
+			pipeline = NewProject(pipeline, stmt.Columns, currentColumns)
+		}
+	}
+
+	if stmt.Limit != nil {
+		pipeline = NewLimit(pipeline, *stmt.Limit)
+	}
+
+	return pipeline, nil
+}
+
+// hasAggregates reports whether any expression in the list is or contains a FuncCall.
+func hasAggregates(exprs []parser.Expr) bool {
+	for _, expr := range exprs {
+		if containsAggregate(expr) {
+			return true
+		}
+	}
+	return false
+}
+
+func containsAggregate(expr parser.Expr) bool {
+	if _, ok := expr.(*parser.FuncCall); ok {
+		return true
+	}
+	switch typed := expr.(type) {
+	case *parser.BinaryExpr:
+		return containsAggregate(typed.Left) || containsAggregate(typed.Right)
+	case *parser.UnaryExpr:
+		return containsAggregate(typed.Operand)
+	}
+	return false
+}
+
+// isSelectStar reports whether the SELECT list is exactly [StarExpr].
+func isSelectStar(exprs []parser.Expr) bool {
+	if len(exprs) != 1 {
+		return false
+	}
+	_, ok := exprs[0].(*parser.StarExpr)
+	return ok
+}
+
+// astToTableDef converts a parser.CreateTableStmt into a catalog.TableDef.
+func astToTableDef(stmt *parser.CreateTableStmt) (*catalog.TableDef, error) {
+	columns := make([]catalog.ColumnDef, 0, len(stmt.Columns))
+	for _, colAST := range stmt.Columns {
+		dataType, err := parseDataType(colAST.TypeName)
+		if err != nil {
+			return nil, err
+		}
+		columns = append(columns, catalog.ColumnDef{
+			Name:       colAST.Name,
+			Type:       dataType,
+			PrimaryKey: colAST.PrimaryKey,
+			NotNull:    colAST.NotNull,
+		})
+	}
+
+	foreignKeys := make([]catalog.ForeignKeyDef, 0, len(stmt.ForeignKeys))
+	for _, fkAST := range stmt.ForeignKeys {
+		foreignKeys = append(foreignKeys, catalog.ForeignKeyDef{
+			ColumnName: fkAST.Column,
+			RefTable:   fkAST.RefTable,
+			RefColumn:  fkAST.RefColumn,
+			OnDelete:   parseFKAction(fkAST.OnDelete),
+			OnUpdate:   parseFKAction(fkAST.OnUpdate),
+		})
+	}
+
+	return &catalog.TableDef{
+		Name:        stmt.Table,
+		Columns:     columns,
+		ForeignKeys: foreignKeys,
+	}, nil
+}
+
+func parseDataType(typeName string) (catalog.DataType, error) {
+	switch strings.ToUpper(typeName) {
+	case "INTEGER", "INT":
+		return catalog.TypeInt, nil
+	case "FLOAT", "REAL", "DOUBLE":
+		return catalog.TypeFloat, nil
+	case "TEXT", "VARCHAR", "CHAR":
+		return catalog.TypeText, nil
+	case "BLOB":
+		return catalog.TypeBlob, nil
+	default:
+		return catalog.TypeText, fmt.Errorf("unknown data type %q", typeName)
+	}
+}
+
+func parseFKAction(action string) catalog.FKAction {
+	switch strings.ToUpper(action) {
+	case "CASCADE":
+		return catalog.FKCascade
+	case "SET NULL":
+		return catalog.FKSetNull
+	default:
+		return catalog.FKRestrict
+	}
 }

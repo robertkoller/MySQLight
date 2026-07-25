@@ -1,45 +1,78 @@
 package wal
 
+type PageWriter interface {
+	WritePage(pageID uint32, data []byte) error
+}
+
 // Recover runs ARIES-style crash recovery on startup.
 // It must be called before the storage engine accepts any new transactions.
 // Dependency: needs access to the storage pager to apply before/after images.
 // TODO: import the storage package once the module path is finalised.
-func Recover(walPath string) error {
-	// TODO: open the WAL; if empty or missing, return nil (nothing to recover)
-	// TODO: records, err := wal.ReadAll()
-	// TODO: activeTxns := analysisPass(records)
-	// TODO: redoPass(records)
-	// TODO: undoPass(records, activeTxns)
-	// TODO: wal.Checkpoint() — truncate WAL after clean recovery
-	panic("not implemented")
+func Recover(walPath string, writer PageWriter) error {
+	wal, err := Open(walPath)
+	if err != nil {
+		return err
+	}
+
+	records, err := wal.ReadAll()
+	if err != nil {
+		return err
+	}
+	active, err := analysisPass(records, writer)
+	if err != nil {
+		return err
+	}
+	undoPass(records, active, writer, wal)
+	if err := wal.Checkpoint(); err != nil {
+		return err
+	}
+	return wal.Close()
 }
 
 // analysisPass scans the WAL forward and returns the set of transaction IDs
 // that were active at the time of the crash (started but never committed/aborted).
-func analysisPass(records []*Record) map[uint64]bool {
-	// TODO: iterate records forward
-	// TODO: RecordBegin  → add TxnID to active set
-	// TODO: RecordCommit → remove TxnID from active set
-	// TODO: RecordAbort  → remove TxnID from active set
-	// TODO: return the active set — these transactions need to be undone
-	panic("not implemented")
-}
+func analysisPass(records []*Record, writer PageWriter) (map[uint64]bool, error) {
+	output := make(map[uint64]bool)
 
-// redoPass re-applies every UPDATE record's AfterImage to bring the database
-// to the exact state it was in at the moment of the crash.
-func redoPass(records []*Record) error {
-	// TODO: iterate records forward
-	// TODO: for each RecordUpdate: write AfterImage to the page via the pager
-	//         (redo applies to ALL updates, including uncommitted ones)
-	panic("not implemented")
+	for _, record := range records {
+		switch record.Type {
+		case RecordAbort:
+			delete(output, record.TxnID)
+		case RecordBegin:
+			output[record.TxnID] = true
+		case RecordCommit:
+			delete(output, record.TxnID)
+		case RecordUpdate:
+			if err := writer.WritePage(record.PageID, record.AfterImage); err != nil {
+				return output, err
+			}
+		}
+	}
+
+	return output, nil
 }
 
 // undoPass rolls back all transactions that were active at crash time by
 // applying their BeforeImages in reverse LSN order.
-func undoPass(records []*Record, activeTxns map[uint64]bool) error {
-	// TODO: iterate records in reverse (highest LSN first)
-	// TODO: for each RecordUpdate whose TxnID is in activeTxns:
-	//         write BeforeImage to the page via the pager
-	// TODO: after all updates for a txn are undone, write a RecordAbort for it
-	panic("not implemented")
+func undoPass(records []*Record, activeTxns map[uint64]bool, writer PageWriter, wal *WAL) error {
+	for i := len(records) - 1; i >= 0; i-- {
+		record := records[i]
+		if record.Type == RecordUpdate {
+			_, exists := activeTxns[record.TxnID]
+			if exists {
+				if err := writer.WritePage(record.PageID, record.BeforeImage); err != nil {
+					return err
+				}
+			}
+		}
+	}
+
+	for id := range activeTxns {
+		_, err := wal.WriteRecord(&Record{TxnID: id, Type: RecordAbort})
+		if err != nil {
+			return err
+		}
+	}
+
+	return nil
 }
