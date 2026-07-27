@@ -9,6 +9,9 @@ import (
 )
 
 func (e *Executor) executeInsert(statement *parser.InsertStmt) error {
+	if err := e.acquireExclusive(statement.Table); err != nil {
+		return err
+	}
 	definition, err := e.catalog.GetTable(statement.Table)
 	if err != nil {
 		return fmt.Errorf("table %q not found: %w", statement.Table, err)

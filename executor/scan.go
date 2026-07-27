@@ -3,13 +3,17 @@ package executor
 import (
 	"github.com/robertkoller/MySQLight/catalog"
 	"github.com/robertkoller/MySQLight/storage"
+	"github.com/robertkoller/MySQLight/txn"
 )
 
 // TableScan iterates every row in a table's B+ tree leaf chain.
 type TableScan struct {
-	tree     *storage.BTree
-	columns  []catalog.ColumnDef
-	iterator storage.Iterator
+	tree      *storage.BTree
+	columns   []catalog.ColumnDef
+	iterator  storage.Iterator
+	txnID     uint64
+	tableName string
+	lockMgr   *txn.LockManager // nil means no locking
 }
 
 // NewTableScan stores the tree and column definitions. The scan does not begin until Open is called.
@@ -17,10 +21,22 @@ func NewTableScan(tree *storage.BTree, columns []catalog.ColumnDef) *TableScan {
 	return &TableScan{tree: tree, columns: columns}
 }
 
-// Open acquires a shared lock on the table and calls btree.Scan(nil, nil) to obtain
-// an iterator that will walk all leaf pages in key order.
+// WithLock attaches transaction lock context to the scan. When set, Open acquires a shared
+// table lock and the lock is held until the transaction commits or rolls back (strict 2PL).
+func (t *TableScan) WithLock(txnID uint64, tableName string, lockMgr *txn.LockManager) *TableScan {
+	t.txnID = txnID
+	t.tableName = tableName
+	t.lockMgr = lockMgr
+	return t
+}
+
+// Open acquires a shared lock on the table (if a lock manager is set) and starts a full scan.
 func (t *TableScan) Open() error {
-	// TODO: acquire shared lock on table (Phase 4)
+	if t.lockMgr != nil {
+		if err := t.lockMgr.Acquire(t.txnID, t.tableName, txn.LockShared); err != nil {
+			return err
+		}
+	}
 	iterator, err := t.tree.Scan(nil, nil)
 	if err != nil {
 		return err
@@ -40,9 +56,9 @@ func (t *TableScan) Next() (Row, error) {
 	return decodeRow(value, t.columns)
 }
 
-// Close shuts down the B+ tree iterator and releases the shared lock on the table.
+// Close shuts down the B+ tree iterator. The shared lock is held until commit or rollback
+// (strict 2PL) and is not released here.
 func (t *TableScan) Close() error {
-	// TODO: release the shared lock (Phase 4)
 	return t.iterator.Close()
 }
 
@@ -54,6 +70,9 @@ type IndexScan struct {
 	start     []byte
 	end       []byte
 	iterator  storage.Iterator
+	txnID     uint64
+	tableName string
+	lockMgr   *txn.LockManager
 }
 
 // NewIndexScan stores both trees, column definitions, and the key range to scan.
@@ -68,10 +87,21 @@ func NewIndexScan(indexTree *storage.BTree, dataTree *storage.BTree, columns []c
 	}
 }
 
-// Open acquires a shared lock on the table and starts a range scan on the index B+ tree
-// between start and end.
+// WithLock attaches transaction lock context to the scan.
+func (s *IndexScan) WithLock(txnID uint64, tableName string, lockMgr *txn.LockManager) *IndexScan {
+	s.txnID = txnID
+	s.tableName = tableName
+	s.lockMgr = lockMgr
+	return s
+}
+
+// Open acquires a shared lock on the table (if a lock manager is set) and starts the range scan.
 func (s *IndexScan) Open() error {
-	// TODO: acquire shared lock on table (Phase 4)
+	if s.lockMgr != nil {
+		if err := s.lockMgr.Acquire(s.txnID, s.tableName, txn.LockShared); err != nil {
+			return err
+		}
+	}
 	iterator, err := s.indexTree.Scan(s.start, s.end)
 	if err != nil {
 		return err
@@ -94,8 +124,7 @@ func (s *IndexScan) Next() (Row, error) {
 	return decodeRow(rowBytes, s.columns)
 }
 
-// Close shuts down the index iterator and releases the shared lock on the table.
+// Close shuts down the index iterator. The shared lock is held until commit or rollback.
 func (s *IndexScan) Close() error {
-	// TODO: release shared lock (Phase 4)
 	return s.iterator.Close()
 }

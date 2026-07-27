@@ -51,9 +51,12 @@ siblings it fetches).
 ### `Insert(key, value) error`
 1. Reject entries larger than `entryCap` (so two can't fail to fit after a split).
 2. `findLeaf(key)` → leaf id + path. Reject duplicates.
-3. Overflow check (`needed` vs `available`, in `int`). If it would overflow,
-   `splitLeaf`, then **re-find** the target leaf (the split may have moved the key
-   right or grown the root).
+3. Overflow check (`needed` vs `available`). If it would overflow:
+   - **Try compaction first:** deletes leave dead key/value bytes behind
+     (the free-space pointer only moves down). If `needed <= PageSize - leafLiveBytes()`,
+     calling `compactLeaf()` reclaims that space and avoids the split entirely.
+   - **Otherwise split:** `splitLeaf`, then **re-find** the target leaf (the split
+     may have moved the key right or grown the root).
 4. `binarySearchKeys(node, key, true)` → slot; `insertLeafEntry`; unpin dirty.
 
 ### `splitLeaf` / `splitInternal`
@@ -164,7 +167,3 @@ path (sibling cross, bound hit, end of chain, `Close`).
 - **Above:** the catalog and executor (later phases) treat each table/index as a
   `BTree` of serialized rows keyed by primary key.
 
-> Open item: `FreePage` for the freelist is wired in, but `pager.go`'s I/O is still
-> `Seek`-based; and the Insert path's split decision uses the leaked free-space
-> pointer rather than live bytes, so a heavily delete-then-insert leaf can split
-> slightly earlier than necessary (correct, just not optimal).

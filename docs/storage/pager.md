@@ -67,15 +67,16 @@ Opens the file (creating it if absent, mode `0644`).
   and loads `pageCount` and `freeListHead` from the header.
 
 ### `ReadPage(pageID uint32) ([]byte, error)`
-Bounds-checks `pageID < pageCount`, seeks to `int64(pageID) * PageSize`, and reads
-exactly `PageSize` bytes into a **freshly allocated** slice. Each call allocates a
+Bounds-checks `pageID < pageCount`, then calls `ReadAt(buffer, int64(pageID)*PageSize)`
+to read exactly `PageSize` bytes into a **freshly allocated** slice. Each call allocates a
 new buffer — this is why the buffer pool exists (to avoid re-reading and
 re-allocating hot pages).
 
 ### `WritePage(pageID uint32, data []byte) error`
 Bounds-checks `pageID`, rejects `data` whose length isn't exactly `PageSize`
-(a partial write would corrupt the fixed-size layout), seeks to the page offset
-and writes. The caller is responsible for forming a complete page first.
+(a partial write would corrupt the fixed-size layout), then calls
+`WriteAt(data, int64(pageID)*PageSize)`. The caller is responsible for forming a
+complete page first.
 
 ### `AllocatePage() (uint32, error)`
 Hands out a page, preferring reuse over growth:
@@ -117,6 +118,3 @@ the handle is released.
   (the latter also dropping the cached frame).
 - The pager is the only component that touches the `*os.File`.
 
-> Minor note: I/O uses `Seek` + `Read`/`Write` on a shared file offset, which is
-> fine single-threaded; `ReadAt`/`WriteAt` would be cleaner and concurrency-safe
-> if that ever matters.

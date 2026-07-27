@@ -19,9 +19,10 @@ const magicByte = "MYSQLIGHT"
 //   27-30 freeListHead (uint32)
 
 type Pager struct {
-	pages        *os.File
-	freeListHead uint32
-	pageCount    uint32
+	pages              *os.File
+	freeListHead       uint32
+	pageCount          uint32
+	catalogRootPageID  uint32
 }
 
 // createHeader builds a fresh PageSize-byte slice formatted as the database header page.
@@ -77,8 +78,9 @@ func Open(path string) (*Pager, error) {
 	}
 
 	pageCount := binary.BigEndian.Uint32(buffer[11:])
+	catalogRootPageID := binary.BigEndian.Uint32(buffer[15:])
 	freeListPage := binary.BigEndian.Uint32(buffer[27:])
-	return &Pager{pages: file, freeListHead: freeListPage, pageCount: pageCount}, nil
+	return &Pager{pages: file, freeListHead: freeListPage, pageCount: pageCount, catalogRootPageID: catalogRootPageID}, nil
 }
 
 // ReadPage reads exactly PageSize bytes from the page identified by pageID and returns
@@ -90,9 +92,7 @@ func (p *Pager) ReadPage(pageID uint32) ([]byte, error) {
 	}
 
 	buffer := make([]byte, PageSize)
-	p.pages.Seek(int64(pageID)*PageSize, 0)
-
-	if _, err := io.ReadFull(p.pages, buffer); err != nil {
+	if _, err := p.pages.ReadAt(buffer, int64(pageID)*PageSize); err != nil {
 		return nil, err
 	}
 	return buffer, nil
@@ -111,8 +111,7 @@ func (p *Pager) WritePage(pageID uint32, data []byte) error {
 		return errors.New("Invalid length of data")
 	}
 
-	p.pages.Seek(int64(pageID)*PageSize, 0)
-	if _, err := p.pages.Write(data); err != nil {
+	if _, err := p.pages.WriteAt(data, int64(pageID)*PageSize); err != nil {
 		return err
 	}
 	return nil
@@ -141,17 +140,15 @@ func (p *Pager) AllocatePage() (uint32, error) {
 
 	// This section makes it so that the file is immediately readable
 	buffer := make([]byte, PageSize)
-	p.pages.Seek(int64(newID)*PageSize, 0)
-	if _, err := p.pages.Write(buffer); err != nil {
+	if _, err := p.pages.WriteAt(buffer, int64(newID)*PageSize); err != nil {
 		return 0, err
 	}
 
 	// this section just updates the header
 	p.pageCount++
-	p.pages.Seek(11, 0)
 	count := make([]byte, 4)
 	binary.BigEndian.PutUint32(count, p.pageCount)
-	if _, err := p.pages.Write(count); err != nil {
+	if _, err := p.pages.WriteAt(count, 11); err != nil {
 		return 0, err
 	}
 
@@ -193,10 +190,28 @@ func (p *Pager) Close() error {
 	return nil
 }
 
+// CatalogRootPageID returns the page ID of the system catalog's B+ tree root as
+// stored in the database header. Returns 0 for a freshly created database before
+// the catalog tree has been allocated.
+func (p *Pager) CatalogRootPageID() uint32 {
+	return p.catalogRootPageID
+}
+
+// SetCatalogRootPageID persists the catalog root page ID to the header and
+// updates the in-memory field. Call this once after creating a new catalog tree.
+func (p *Pager) SetCatalogRootPageID(id uint32) error {
+	buf := make([]byte, 4)
+	binary.BigEndian.PutUint32(buf, id)
+	if _, err := p.pages.WriteAt(buf, 15); err != nil {
+		return err
+	}
+	p.catalogRootPageID = id
+	return nil
+}
+
 func (p *Pager) writeFreeListHead() error {
-	p.pages.Seek(27, 0)
-	bytes := make([]byte, 4)
-	binary.BigEndian.PutUint32(bytes, p.freeListHead)
-	_, err := p.pages.Write(bytes)
+	buf := make([]byte, 4)
+	binary.BigEndian.PutUint32(buf, p.freeListHead)
+	_, err := p.pages.WriteAt(buf, 27)
 	return err
 }

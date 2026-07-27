@@ -1,42 +1,63 @@
 package planner
 
-// LogicalNode is the interface for all logical plan nodes.
-// The logical plan mirrors the executor operator tree but contains no physical
-// decisions yet (e.g. it says "scan table X" not "use index Y").
+import (
+	"fmt"
+	"strings"
+
+	"github.com/robertkoller/MySQLight/catalog"
+	"github.com/robertkoller/MySQLight/parser"
+)
+
+// LogicalNode is the interface every logical plan node implements.
+// The logical plan mirrors the physical operator tree but contains no physical
+// decisions — it says "scan table X" not "use index Y on column Z".
 type LogicalNode interface {
 	logicalNode()
 	Children() []LogicalNode
 }
 
 type LogicalScan struct {
-	Table string
+	Table   string
+	Columns []catalog.ColumnDef
+}
+
+// LogicalIndexScan replaces a LogicalScan+LogicalFilter pair when the optimizer
+// determines that an index on the filtered column makes a range or point scan cheaper.
+type LogicalIndexScan struct {
+	Table   string
+	Index   string
+	Column  string
+	Columns []catalog.ColumnDef
+	Exact   parser.Expr // non-nil for equality predicate (col = value)
+	Low     parser.Expr // non-nil for range lower bound (col >= value)
+	High    parser.Expr // non-nil for range upper bound (col <= value)
 }
 
 type LogicalFilter struct {
 	Child     LogicalNode
-	Predicate interface{} // AST Expr
+	Predicate parser.Expr
 }
 
 type LogicalProject struct {
 	Child   LogicalNode
-	Columns []interface{} // AST Expr list
+	Columns []parser.Expr
 }
 
 type LogicalJoin struct {
 	Left      LogicalNode
 	Right     LogicalNode
-	Condition interface{} // AST Expr
+	Condition parser.Expr
 }
 
 type LogicalAggregate struct {
 	Child   LogicalNode
-	GroupBy []interface{}
-	Aggs    []interface{}
+	GroupBy []parser.Expr
+	Aggs    []parser.Expr
 }
 
 type LogicalSort struct {
 	Child   LogicalNode
-	OrderBy []interface{}
+	OrderBy []parser.OrderClause
 }
 
 type LogicalLimit struct {
@@ -45,6 +66,7 @@ type LogicalLimit struct {
 }
 
 func (n *LogicalScan) logicalNode()      {}
+func (n *LogicalIndexScan) logicalNode() {}
 func (n *LogicalFilter) logicalNode()    {}
 func (n *LogicalProject) logicalNode()   {}
 func (n *LogicalJoin) logicalNode()      {}
@@ -53,6 +75,7 @@ func (n *LogicalSort) logicalNode()      {}
 func (n *LogicalLimit) logicalNode()     {}
 
 func (n *LogicalScan) Children() []LogicalNode      { return nil }
+func (n *LogicalIndexScan) Children() []LogicalNode { return nil }
 func (n *LogicalFilter) Children() []LogicalNode    { return []LogicalNode{n.Child} }
 func (n *LogicalProject) Children() []LogicalNode   { return []LogicalNode{n.Child} }
 func (n *LogicalJoin) Children() []LogicalNode      { return []LogicalNode{n.Left, n.Right} }
@@ -61,40 +84,95 @@ func (n *LogicalSort) Children() []LogicalNode      { return []LogicalNode{n.Chi
 func (n *LogicalLimit) Children() []LogicalNode     { return []LogicalNode{n.Child} }
 
 // Planner converts a parsed AST statement into a logical plan tree.
-// The plan is a tree, not a DAG — no topological sort needed.
-// (If CTEs or subqueries are added later and the plan becomes a DAG,
-// topological sort over named sub-plans would determine materialisation order.)
+// The plan is built bottom-up: scan → filter → join(s) → aggregate/project → sort → limit.
 type Planner struct {
-	// TODO: catalog reference — needed to validate table/column names
+	catalog *catalog.Catalog
 }
 
-// NewPlanner initialises the planner with a reference to the catalog, which is needed
-// to validate table and column names at plan-build time.
-func NewPlanner() *Planner {
-	panic("not implemented")
+// NewPlanner initialises the planner with a reference to the catalog, which is used
+// to validate table names, resolve column definitions, and detect available indexes.
+func NewPlanner(cat *catalog.Catalog) *Planner {
+	return &Planner{catalog: cat}
 }
 
-// Plan converts a parsed statement into a logical plan tree. Currently only SELECT
-// statements produce a logical plan; DML statements go directly to the executor without
-// planning.
+// Plan converts a parsed statement into a logical plan tree. Only SELECT statements
+// are planned here; DML goes directly to the executor without a logical plan.
 func (p *Planner) Plan(stmt interface{}) (LogicalNode, error) {
-	// TODO: type-switch on stmt:
-	//   *parser.SelectStmt → planSelect
-	//   others             → error (DML goes straight to the executor, not the planner)
-	panic("not implemented")
+	switch typed := stmt.(type) {
+	case *parser.SelectStmt:
+		return p.planSelect(typed)
+	default:
+		return nil, fmt.Errorf("planner: cannot plan statement of type %T", stmt)
+	}
 }
 
-// planSelect builds a logical plan tree for a SELECT statement bottom-up. It starts with
-// a LogicalScan for the FROM table, then wraps it in nodes for WHERE (LogicalFilter),
-// JOIN (LogicalJoin), GROUP BY and aggregates (LogicalAggregate), SELECT list (LogicalProject),
-// ORDER BY (LogicalSort), and LIMIT (LogicalLimit) as each clause is present in the statement.
-func (p *Planner) planSelect(stmt interface{}) (LogicalNode, error) {
-	// TODO: start with LogicalScan{Table: stmt.From}
-	// TODO: if stmt.Where != nil: wrap in LogicalFilter{Predicate: stmt.Where}
-	// TODO: if stmt.Joins:        for each join, wrap in LogicalJoin
-	// TODO: if stmt.GroupBy/Aggs: wrap in LogicalAggregate
-	// TODO: wrap in LogicalProject{Columns: stmt.Columns}
-	// TODO: if stmt.OrderBy:      wrap in LogicalSort
-	// TODO: if stmt.Limit:        wrap in LogicalLimit
-	panic("not implemented")
+// planSelect builds a logical plan tree for a SELECT statement bottom-up.
+func (p *Planner) planSelect(stmt *parser.SelectStmt) (LogicalNode, error) {
+	if stmt.From == "" {
+		return nil, fmt.Errorf("planner: SELECT requires a FROM clause")
+	}
+
+	tableDef, err := p.catalog.GetTable(stmt.From)
+	if err != nil {
+		return nil, fmt.Errorf("planner: table %q not found: %w", stmt.From, err)
+	}
+
+	var current LogicalNode = &LogicalScan{Table: stmt.From, Columns: tableDef.Columns}
+
+	if stmt.Where != nil {
+		current = &LogicalFilter{Child: current, Predicate: stmt.Where}
+	}
+
+	for _, join := range stmt.Joins {
+		joinedDef, joinErr := p.catalog.GetTable(join.Table)
+		if joinErr != nil {
+			return nil, fmt.Errorf("planner: join table %q not found: %w", join.Table, joinErr)
+		}
+		current = &LogicalJoin{
+			Left:      current,
+			Right:     &LogicalScan{Table: join.Table, Columns: joinedDef.Columns},
+			Condition: join.On,
+		}
+	}
+
+	if len(stmt.GroupBy) > 0 || containsAggregate(stmt.Columns) {
+		current = &LogicalAggregate{Child: current, GroupBy: stmt.GroupBy, Aggs: stmt.Columns}
+		if stmt.Having != nil {
+			current = &LogicalFilter{Child: current, Predicate: stmt.Having}
+		}
+	} else {
+		current = &LogicalProject{Child: current, Columns: stmt.Columns}
+	}
+
+	if len(stmt.OrderBy) > 0 {
+		current = &LogicalSort{Child: current, OrderBy: stmt.OrderBy}
+	}
+
+	if stmt.Limit != nil {
+		current = &LogicalLimit{Child: current, N: *stmt.Limit}
+	}
+
+	return current, nil
+}
+
+func containsAggregate(exprs []parser.Expr) bool {
+	for _, expr := range exprs {
+		if hasAggregateFuncCall(expr) {
+			return true
+		}
+	}
+	return false
+}
+
+func hasAggregateFuncCall(expr parser.Expr) bool {
+	switch typed := expr.(type) {
+	case *parser.FuncCall:
+		name := strings.ToUpper(typed.Name)
+		return name == "COUNT" || name == "SUM" || name == "MIN" || name == "MAX" || name == "AVG"
+	case *parser.BinaryExpr:
+		return hasAggregateFuncCall(typed.Left) || hasAggregateFuncCall(typed.Right)
+	case *parser.UnaryExpr:
+		return hasAggregateFuncCall(typed.Operand)
+	}
+	return false
 }

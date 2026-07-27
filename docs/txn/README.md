@@ -41,27 +41,22 @@ Phase 4c/4d of MySQLight. The transaction manager provides ACID semantics: it co
 
 | Function / Method | Description |
 |---|---|
-| `NewTxnManager(wal *wal.WAL, writer wal.PageWriter) *TxnManager` | Initialises with `nextID=1`, empty active map, new lock manager. |
+| `NewTxnManager(walFile *wal.WAL, pool *storage.BufferPool) *TxnManager` | Initialises with `nextID=1`, empty active map, new lock manager. |
+| `(m *TxnManager) LockManager() *LockManager` | Returns the embedded lock manager (used by executor to wire `WithLock` on scans). |
 | `(m *TxnManager) Begin() (*Txn, error)` | Allocates a `Txn`, writes `RecordBegin`, registers in active map. |
 | `(m *TxnManager) Commit(txn *Txn) error` | Validates active, writes `RecordCommit`, releases all locks, marks committed. |
-| `(m *TxnManager) Rollback(txn *Txn) error` | Validates active, applies undo log in reverse, writes `RecordAbort`, releases all locks, marks aborted. |
+| `(m *TxnManager) Rollback(txn *Txn) error` | Validates active, calls `pool.RollbackTxn`, writes `RecordAbort`, releases all locks, marks aborted. |
 
 ### Key types
 
 ```go
 type Txn struct {
-    ID      uint64
-    State   TxnState    // TxnActive, TxnCommitted, TxnAborted
-    undoLog []UndoEntry // before-images to restore on rollback
-}
-
-type UndoEntry struct {
-    pageID      uint32
-    beforeImage []byte // full 4096-byte page snapshot
+    ID    uint64
+    State TxnState // TxnActive, TxnCommitted, TxnAborted
 }
 ```
 
-`undoLog` is appended to by the executor each time a page is modified within a transaction. `Rollback` iterates it in reverse — last modified page is restored first — to unwind changes in the correct order.
+There is no per-transaction undo log in the transaction manager. Before-image tracking lives entirely in the buffer pool: `pool.RollbackTxn(txnID)` restores before-images for all pages dirtied by that transaction. If a dirty page was evicted before rollback, its before-image is written back to disk via the pager.
 
 ---
 
@@ -112,26 +107,26 @@ The lock manager enforces the *growing phase* (acquire locks as needed) but reli
 
 ---
 
-## Phase 4c/4d status — complete
+## Status — complete
 
 | Component | Status |
 |---|---|
 | `TxnState` (Active, Committed, Aborted) | Done |
-| `UndoEntry` (pageID + before-image) | Done |
-| `Txn` struct with undo log | Done |
+| `Txn` struct | Done |
 | `TxnManager` — Begin / Commit / Rollback | Done |
 | WAL record writes on each lifecycle event | Done |
 | Lock release on Commit and Rollback | Done |
-| Undo log application in Rollback | Done |
+| `pool.RollbackTxn` delegation on Rollback | Done |
+| Buffer pool before-image tracking | Done |
+| Executor `acquireExclusive` on DML | Done |
+| Executor `WithLock` on SELECT scans (strict 2PL) | Done |
 | `LockManager` — Acquire / Release / ReleaseAll | Done |
 | Channel-based blocking for incompatible locks | Done |
 | FIFO waiter grant order | Done |
 | `detectDeadlock` — wait-for graph + DFS | Done |
 | Tests (9 cases) | Done |
 
-### Not in Phase 4c/4d
+### Not yet implemented
 
-- Executor integration: acquiring table locks before reads/writes — stretch goal
-- Buffer pool integration: appending `UndoEntry` before each page flush — stretch goal
 - Background goroutine running `detectDeadlock` periodically — stretch goal
 - Row-level locking (MVCC) — stretch goal

@@ -10,6 +10,9 @@ import (
 )
 
 func (e *Executor) executeUpdate(statement *parser.UpdateStmt) error {
+	if err := e.acquireExclusive(statement.Table); err != nil {
+		return err
+	}
 	definition, err := e.catalog.GetTable(statement.Table)
 	if err != nil {
 		return fmt.Errorf("table %q not found: %w", statement.Table, err)
@@ -100,8 +103,6 @@ func (e *Executor) executeUpdate(statement *parser.UpdateStmt) error {
 				return err
 			}
 		}
-
-		// TODO: write WAL before-image record (Phase 4)
 
 		if err := dataTree.Delete(oldPKBytes); err != nil {
 			return fmt.Errorf("deleting old row: %w", err)

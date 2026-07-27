@@ -62,6 +62,9 @@ func Open(tree *storage.BTree) (*Catalog, error) {
 				return nil, err
 			}
 			tables[string(key)] = table
+			if _, exists := tableIndexes[table.Name]; !exists {
+				tableIndexes[table.Name] = []string{}
+			}
 		case 0x02:
 			index, err := decodeIndexDef(value)
 			if err != nil {

@@ -8,6 +8,7 @@ import (
 	"github.com/robertkoller/MySQLight/catalog"
 	"github.com/robertkoller/MySQLight/parser"
 	"github.com/robertkoller/MySQLight/storage"
+	"github.com/robertkoller/MySQLight/txn"
 )
 
 // Row is an ordered slice of values for one result row.
@@ -22,13 +23,25 @@ type Operator interface {
 
 // Executor dispatches a parsed Statement to the correct execution path.
 type Executor struct {
-	catalog *catalog.Catalog
-	pool    *storage.BufferPool
+	catalog    *catalog.Catalog
+	pool       *storage.BufferPool
+	txnManager *txn.TxnManager
+	currentTxn *txn.Txn
 }
 
-// NewExecutor initialises the executor with references to the catalog and buffer pool.
-func NewExecutor(cat *catalog.Catalog, pool *storage.BufferPool) *Executor {
-	return &Executor{catalog: cat, pool: pool}
+// NewExecutor initialises the executor with references to the catalog, buffer pool, and
+// an optional transaction manager. Pass nil for txnManager to disable transaction support.
+func NewExecutor(cat *catalog.Catalog, pool *storage.BufferPool, txnManager *txn.TxnManager) *Executor {
+	return &Executor{catalog: cat, pool: pool, txnManager: txnManager}
+}
+
+// acquireExclusive acquires an exclusive table lock for the current transaction.
+// It is a no-op when no transaction is active or no txnManager is configured.
+func (e *Executor) acquireExclusive(tableName string) error {
+	if e.currentTxn == nil || e.txnManager == nil {
+		return nil
+	}
+	return e.txnManager.LockManager().Acquire(e.currentTxn.ID, tableName, txn.LockExclusive)
 }
 
 // Execute dispatches a parsed statement to the correct execution path. SELECT
@@ -75,8 +88,42 @@ func (e *Executor) Execute(stmt interface{}) ([]Row, error) {
 	case *parser.UpdateStmt:
 		return nil, e.executeUpdate(typed)
 
-	case *parser.BeginStmt, *parser.CommitStmt, *parser.RollbackStmt:
-		return nil, fmt.Errorf("transactions not yet implemented (Phase 4)")
+	case *parser.BeginStmt:
+		if e.txnManager == nil {
+			return nil, fmt.Errorf("transaction manager not configured")
+		}
+		if e.currentTxn != nil {
+			return nil, fmt.Errorf("transaction already in progress")
+		}
+		txnObj, err := e.txnManager.Begin()
+		if err != nil {
+			return nil, err
+		}
+		e.currentTxn = txnObj
+		e.pool.SetTxnID(txnObj.ID)
+		return nil, nil
+
+	case *parser.CommitStmt:
+		if e.currentTxn == nil {
+			return nil, fmt.Errorf("no transaction in progress")
+		}
+		if err := e.txnManager.Commit(e.currentTxn); err != nil {
+			return nil, err
+		}
+		e.currentTxn = nil
+		e.pool.SetTxnID(0)
+		return nil, nil
+
+	case *parser.RollbackStmt:
+		if e.currentTxn == nil {
+			return nil, fmt.Errorf("no transaction in progress")
+		}
+		if err := e.txnManager.Rollback(e.currentTxn); err != nil {
+			return nil, err
+		}
+		e.currentTxn = nil
+		e.pool.SetTxnID(0)
+		return nil, nil
 
 	case *parser.AnalyzeStmt:
 		return nil, fmt.Errorf("ANALYZE not yet implemented")
@@ -125,7 +172,11 @@ func (e *Executor) buildSelectPipeline(stmt *parser.SelectStmt) (Operator, error
 		return nil, err
 	}
 
-	var pipeline Operator = NewTableScan(dataTree, definition.Columns)
+	leftScan := NewTableScan(dataTree, definition.Columns)
+	if e.currentTxn != nil && e.txnManager != nil {
+		leftScan.WithLock(e.currentTxn.ID, stmt.From, e.txnManager.LockManager())
+	}
+	var pipeline Operator = leftScan
 	currentColumns := append([]catalog.ColumnDef{}, definition.Columns...)
 
 	for _, join := range stmt.Joins {
@@ -138,6 +189,9 @@ func (e *Executor) buildSelectPipeline(stmt *parser.SelectStmt) (Operator, error
 			return nil, err
 		}
 		rightScan := NewTableScan(rightTree, rightDef.Columns)
+		if e.currentTxn != nil && e.txnManager != nil {
+			rightScan.WithLock(e.currentTxn.ID, join.Table, e.txnManager.LockManager())
+		}
 		pipeline = NewNestedLoopJoin(pipeline, rightScan, join.On, currentColumns, rightDef.Columns)
 		currentColumns = append(currentColumns, rightDef.Columns...)
 	}

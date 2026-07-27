@@ -48,7 +48,7 @@ func newTestExecutor(t *testing.T) (*Executor, func()) {
 		os.Remove(file.Name())
 	}
 
-	return NewExecutor(cat, pool), cleanup
+	return NewExecutor(cat, pool, nil), cleanup
 }
 
 // mustExec parses and executes sql, failing the test on any error.

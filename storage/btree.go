@@ -108,6 +108,13 @@ func NewBTree(pool *BufferPool, rootPageID uint32) (*BTree, error) {
 	return &BTree{pool: pool, rootPageID: rootPageID}, nil
 }
 
+// RootPageID returns the current root page of the tree. The root changes when
+// the root splits; callers that persist the tree across opens must re-read this
+// after any Insert that could have caused a root split.
+func (t *BTree) RootPageID() uint32 {
+	return t.rootPageID
+}
+
 // Insert adds a key-value pair to the tree, maintaining sorted order within leaf pages.
 // If inserting into the target leaf causes it to overflow, the leaf is split and the median
 // key is pushed up to the parent. Splits propagate upward recursively; if the root itself
@@ -133,17 +140,26 @@ func (t *BTree) Insert(key, value []byte) error {
 	needed := (len(key) + len(value) + 8)
 	available := int(node.findFreeSpace()) - (slotStart + int(node.keyCount())*8)
 	if needed > available {
-		median, rightPageID, err := t.splitLeaf(page, node, path)
-		if err != nil {
-			return err
-		}
-		t.pool.UnpinPage(leafPageID, true)
-		if bytes.Compare(key, median) >= 0 {
-			leafPageID = rightPageID
-		}
-		page, node, err = t.pool.fetchNode(leafPageID)
-		if err != nil {
-			return err
+		// Dead bytes from prior deletes may account for the shortfall. Compact first
+		// and re-check: if the entry fits in the live footprint, avoid the split.
+		if needed <= PageSize-node.leafLiveBytes() {
+			if err := node.compactLeaf(); err != nil {
+				t.pool.UnpinPage(leafPageID, true)
+				return err
+			}
+		} else {
+			median, rightPageID, err := t.splitLeaf(page, node, path)
+			if err != nil {
+				return err
+			}
+			t.pool.UnpinPage(leafPageID, true)
+			if bytes.Compare(key, median) >= 0 {
+				leafPageID = rightPageID
+			}
+			page, node, err = t.pool.fetchNode(leafPageID)
+			if err != nil {
+				return err
+			}
 		}
 	}
 

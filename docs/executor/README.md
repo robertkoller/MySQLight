@@ -242,12 +242,41 @@ are mapped to `catalog.DataType` constants by `parseDataType`.
 
 ---
 
-## Phase 3 status — complete
+## Transaction and locking integration (Phase 4)
+
+The executor integrates with the `txn` package to provide ACID semantics. `Executor` holds a `*txn.TxnManager` and `*txn.Txn`:
+
+```go
+type Executor struct {
+    catalog    *catalog.Catalog
+    pool       *storage.BufferPool
+    txnManager *txn.TxnManager
+    currentTxn *txn.Txn
+}
+```
+
+### Transaction lifecycle
+
+`Execute` handles `BeginStmt`, `CommitStmt`, and `RollbackStmt` by delegating to `TxnManager`. On `BEGIN`, `pool.SetTxnID` is called so the buffer pool associates dirty pages with the active transaction. On `COMMIT` or `ROLLBACK`, `SetTxnID(0)` clears the association.
+
+### Locking
+
+The executor acquires table-level locks before any read or write:
+
+- **DML** (`INSERT`, `UPDATE`, `DELETE`): `acquireExclusive(tableName)` at the start of each operation.
+- **SELECT** scans: `TableScan` and `IndexScan` each have a `WithLock(txnID, table, lockMgr)` builder. When a transaction is active, `buildSelectPipeline` sets `WithLock` so that `Open()` acquires a shared lock on the table.
+
+Strict 2PL is enforced: locks are never released mid-transaction. `ReleaseAll` is called only inside `Commit` or `Rollback`.
+
+---
+
+## Status — complete
 
 | Component | Status |
 |---|---|
 | `Operator` interface + `collectRows` | Done |
 | `TableScan` / `IndexScan` | Done |
+| `TableScan.WithLock` / `IndexScan.WithLock` (strict 2PL) | Done |
 | `Filter` + `evalExpr` (all expression types) | Done |
 | `Project` / `Sort` / `Limit` | Done |
 | `NestedLoopJoin` | Done |
@@ -258,13 +287,13 @@ are mapped to `catalog.DataType` constants by `parseDataType`.
 | `DELETE` (WHERE, index maintenance) | Done |
 | FK enforcement (RESTRICT / CASCADE / SET NULL) | Done |
 | DDL dispatch (CREATE/DROP TABLE/INDEX) | Done |
+| BEGIN / COMMIT / ROLLBACK handling | Done |
+| Exclusive lock acquisition on DML | Done |
+| Shared lock acquisition on SELECT scans | Done |
 | Tests (26 cases) | Done |
 
-### Not in Phase 3 (later phases)
+### Not yet integrated
 
-- WAL before-image records on mutations — Phase 4
-- Transaction BEGIN / COMMIT / ROLLBACK — Phase 4
-- Table-level shared/exclusive locking — Phase 4
-- Index selection by the query planner — Phase 5
-- ORDER BY on aggregate result sets — Phase 5
 - `IN (...)` and subquery expressions — stretch goal
+- ORDER BY on aggregate result sets — stretch goal
+- Logical plan from `planner` wired into `buildSelectPipeline` — physical plan builder pending

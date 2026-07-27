@@ -1,40 +1,42 @@
 package txn
 
 import (
-	"bytes"
 	"path/filepath"
 	"testing"
 	"time"
 
+	"github.com/robertkoller/MySQLight/storage"
 	"github.com/robertkoller/MySQLight/wal"
 )
 
-type mockPageWriter struct {
-	written map[uint32][]byte
-}
-
-func (m *mockPageWriter) WritePage(pageID uint32, data []byte) error {
-	if m.written == nil {
-		m.written = make(map[uint32][]byte)
-	}
-	m.written[pageID] = append([]byte{}, data...)
-	return nil
-}
-
-func newTestManager(t *testing.T) (*TxnManager, func()) {
+func newTestManager(t *testing.T) (*TxnManager, *storage.BufferPool, func()) {
 	t.Helper()
-	path := filepath.Join(t.TempDir(), "test")
-	walFile, err := wal.Open(path)
+	directory := t.TempDir()
+	walPath := filepath.Join(directory, "test")
+	dbPath := filepath.Join(directory, "test.db")
+
+	walFile, err := wal.Open(walPath)
 	if err != nil {
 		t.Fatalf("wal.Open: %v", err)
 	}
-	writer := &mockPageWriter{}
-	manager := NewTxnManager(walFile, writer)
-	return manager, func() { walFile.Close() }
+	pager, err := storage.Open(dbPath)
+	if err != nil {
+		t.Fatalf("storage.Open: %v", err)
+	}
+	pool := storage.NewBufferPool(pager, 64)
+	pool.SetWAL(walFile)
+
+	manager := NewTxnManager(walFile, pool)
+	cleanup := func() {
+		pool.FlushAll()
+		walFile.Close()
+		pager.Close()
+	}
+	return manager, pool, cleanup
 }
 
 func TestBeginCommit(t *testing.T) {
-	manager, cleanup := newTestManager(t)
+	manager, _, cleanup := newTestManager(t)
 	defer cleanup()
 
 	transaction, err := manager.Begin()
@@ -60,7 +62,7 @@ func TestBeginCommit(t *testing.T) {
 }
 
 func TestCommitInactiveErrors(t *testing.T) {
-	manager, cleanup := newTestManager(t)
+	manager, _, cleanup := newTestManager(t)
 	defer cleanup()
 
 	transaction, _ := manager.Begin()
@@ -72,18 +74,23 @@ func TestCommitInactiveErrors(t *testing.T) {
 }
 
 func TestRollback(t *testing.T) {
-	manager, cleanup := newTestManager(t)
+	manager, pool, cleanup := newTestManager(t)
 	defer cleanup()
-
-	writer := manager.pageWriter.(*mockPageWriter)
-	beforeImage := bytes.Repeat([]byte{0x11}, 4096)
 
 	transaction, err := manager.Begin()
 	if err != nil {
 		t.Fatalf("Begin: %v", err)
 	}
+	pool.SetTxnID(transaction.ID)
 
-	transaction.undoLog = append(transaction.undoLog, UndoEntry{pageID: 5, beforeImage: beforeImage})
+	// Fetch the header page, record its original state, then dirty it.
+	page, err := pool.FetchPage(0)
+	if err != nil {
+		t.Fatalf("FetchPage: %v", err)
+	}
+	originalByte := page.Data[100]
+	page.Data[100] ^= 0xFF
+	pool.UnpinPage(0, true)
 
 	if err := manager.Rollback(transaction); err != nil {
 		t.Fatalf("Rollback: %v", err)
@@ -94,13 +101,21 @@ func TestRollback(t *testing.T) {
 	if _, ok := manager.active[transaction.ID]; ok {
 		t.Error("transaction should be removed from active map after Rollback")
 	}
-	if !bytes.Equal(writer.written[5], beforeImage) {
-		t.Error("before image was not applied to page 5 during rollback")
+
+	// Verify the page was restored to its before-image.
+	restoredPage, err := pool.FetchPage(0)
+	if err != nil {
+		t.Fatalf("FetchPage after rollback: %v", err)
+	}
+	defer pool.UnpinPage(0, false)
+
+	if restoredPage.Data[100] != originalByte {
+		t.Errorf("byte not restored: expected %v got %v", originalByte, restoredPage.Data[100])
 	}
 }
 
 func TestRollbackInactiveErrors(t *testing.T) {
-	manager, cleanup := newTestManager(t)
+	manager, _, cleanup := newTestManager(t)
 	defer cleanup()
 
 	transaction, _ := manager.Begin()
@@ -112,7 +127,7 @@ func TestRollbackInactiveErrors(t *testing.T) {
 }
 
 func TestLockSharedCompatible(t *testing.T) {
-	manager, cleanup := newTestManager(t)
+	manager, _, cleanup := newTestManager(t)
 	defer cleanup()
 
 	if err := manager.lockMgr.Acquire(1, "users", LockShared); err != nil {
@@ -124,7 +139,7 @@ func TestLockSharedCompatible(t *testing.T) {
 }
 
 func TestLockExclusiveBlocksShared(t *testing.T) {
-	manager, cleanup := newTestManager(t)
+	manager, _, cleanup := newTestManager(t)
 	defer cleanup()
 
 	if err := manager.lockMgr.Acquire(1, "users", LockShared); err != nil {
@@ -153,7 +168,7 @@ func TestLockExclusiveBlocksShared(t *testing.T) {
 }
 
 func TestLockExclusiveBlocksExclusive(t *testing.T) {
-	manager, cleanup := newTestManager(t)
+	manager, _, cleanup := newTestManager(t)
 	defer cleanup()
 
 	if err := manager.lockMgr.Acquire(1, "users", LockExclusive); err != nil {
@@ -182,7 +197,7 @@ func TestLockExclusiveBlocksExclusive(t *testing.T) {
 }
 
 func TestReleaseAll(t *testing.T) {
-	manager, cleanup := newTestManager(t)
+	manager, _, cleanup := newTestManager(t)
 	defer cleanup()
 
 	manager.lockMgr.Acquire(1, "users", LockExclusive)
@@ -210,7 +225,7 @@ func TestReleaseAll(t *testing.T) {
 }
 
 func TestDeadlockDetection(t *testing.T) {
-	manager, cleanup := newTestManager(t)
+	manager, _, cleanup := newTestManager(t)
 	defer cleanup()
 
 	manager.lockMgr.Acquire(1, "tableX", LockExclusive)

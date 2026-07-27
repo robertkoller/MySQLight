@@ -11,6 +11,9 @@ import (
 )
 
 func (e *Executor) executeDelete(statement *parser.DeleteStmt) error {
+	if err := e.acquireExclusive(statement.Table); err != nil {
+		return err
+	}
 	definition, err := e.catalog.GetTable(statement.Table)
 	if err != nil {
 		return fmt.Errorf("table %q not found: %w", statement.Table, err)
@@ -46,8 +49,6 @@ func (e *Executor) executeDelete(statement *parser.DeleteStmt) error {
 	if err := scan.Close(); err != nil {
 		return err
 	}
-
-	// TODO: write WAL before-image record (Phase 4)
 
 	return e.deleteRowsFromTable(definition, matchingRows)
 }
